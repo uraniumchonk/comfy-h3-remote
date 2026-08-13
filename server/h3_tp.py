@@ -320,7 +320,14 @@ class Int8Shard(nn.Module):
         return self
 
     def forward(self, x):
-        return int8_linear(x, self.qdata, self.scale, self.input_act)
+        y = int8_linear(x, self.qdata, self.scale, self.input_act)
+        for A, B, s in getattr(self, "_h3_lora", ()) or ():
+            if s == 0:
+                continue
+            Aa = A.to(device=y.device, dtype=y.dtype, non_blocking=True)
+            Bb = B.to(device=y.device, dtype=y.dtype, non_blocking=True)
+            y = y + s * (x.to(dtype=y.dtype) @ Aa.t()) @ Bb.t()
+        return y
 
 
 def _qt_parts(linear):

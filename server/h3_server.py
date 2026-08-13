@@ -221,6 +221,25 @@ def run_denoise(data):
 
     model = patch_sampling(MODEL, shift_v, shift_a)
 
+    dit = MODEL.model.diffusion_model
+    lora_specs = data.get("loras") or []
+    try:
+        from h3_lora import apply_loras, clear_loras
+        if lora_specs:
+            resolved = []
+            root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "loras")
+            for spec in lora_specs:
+                name = (spec.get("name") or spec.get("path") or "").replace("\\", "/").lstrip("/")
+                if not name or name == "None":
+                    continue
+                path = name if os.path.isabs(name) else os.path.join(root, name)
+                resolved.append({"path": path, "strength": float(spec.get("strength", 1.0))})
+            apply_loras(dit, resolved)
+        else:
+            clear_loras(dit)
+    except Exception as e:
+        print(f"[h3-server] lora skipped: {e}", flush=True)
+
     # dynamic resident: small payload -> short seq -> small attention workspace
     # -> keep more blocks resident and skip H2D for them.
     dit = MODEL.model.diffusion_model
