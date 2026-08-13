@@ -219,10 +219,12 @@ class RemoteDenoiseNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "latent_image": ("LATENT", {}),
                 "positive": ("CONDITIONING", {}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 100, "step": 1}),
-                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "cfg": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1,
+                    "tooltip": "Official H3 is 1.0 (flow-matching, no CFG). >1 is allowed; snow/black is on you.",
+                }),
                 "sampler_name": (_SAMPLERS, {"default": "res_multistep"}),
                 "scheduler": (_SCHEDULERS, {"default": "simple"}),
                 "seed": ("INT", {
@@ -241,6 +243,7 @@ class RemoteDenoiseNode:
             },
             "optional": {
                 "negative": ("CONDITIONING", {}),
+                "latent_image": ("LATENT", {}),
                 "lora_stack": ("H3_LORA_STACK",),
                 "lora_name": (_LORA_LIST, {"default": "None"}),
                 "lora_strength": ("FLOAT", {"default": 0.9, "min": -2.0, "max": 2.0, "step": 0.05}),
@@ -251,9 +254,12 @@ class RemoteDenoiseNode:
     FUNCTION = "denoise"
     CATEGORY = "MiniMax H3"
 
-    def denoise(self, latent_image, positive, steps, cfg, sampler_name, scheduler,
-                seed, denoise, shift_video, shift_audio, server_url, negative=None,
-                lora_stack=None, lora_name="None", lora_strength=0.9):
+    def denoise(self, positive, steps, cfg, sampler_name, scheduler,
+                seed, denoise, shift_video, shift_audio, server_url,
+                negative=None, latent_image=None, lora_stack=None,
+                lora_name="None", lora_strength=0.9):
+        if latent_image is None:
+            raise ValueError("latent_image is required")
         data = {
             "latent_image": latent_image,
             "positive": positive,
