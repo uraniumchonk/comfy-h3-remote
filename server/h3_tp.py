@@ -194,6 +194,33 @@ def _pick_resident(n, devices, default=None):
     return max(0, min(default, cap, n))
 
 
+def split_packed_seq(h, rope_freqs, mod_segments, rank, world):
+    """Raylight-style sequence split: local h + local rope + local segments.
+
+    h: [S, H], rope_freqs: [S, R] (or [1, S, R]), mod_segments: [(a,b,row)].
+    Returns (h_local, rope_local, segments_local) for this rank.
+    """
+    s = h.shape[0]
+    local = s // world
+    start = rank * local
+    end = start + local
+    segs_local = []
+    for a, b, row in mod_segments:
+        a2 = max(a, start)
+        b2 = min(b, end)
+        if a2 < b2:
+            segs_local.append((a2 - start, b2 - start, row))
+    h_local = h[start:end].contiguous()
+    if rope_freqs is not None:
+        if rope_freqs.dim() == 2:
+            rope_local = rope_freqs[start:end].contiguous()
+        else:
+            rope_local = rope_freqs[:, start:end].contiguous()
+    else:
+        rope_local = None
+    return h_local, rope_local, segs_local
+
+
 def _make_streams(devices):
     streams = []
     for dev in devices:
