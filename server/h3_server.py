@@ -11,14 +11,19 @@ MiniMax H3 Ref2VA 遠端 denoise server（跑在 192.168.0.160）
 避免跨 ComfyUI 版本 pickle class 引用問題。
 """
 import argparse
+import asyncio
 import gc
 import io
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Set device before importing torch to avoid CUDA init issues
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("NCCL_DEBUG", "WARN")
 
 import torch
 
@@ -103,9 +108,11 @@ def load_model(path, tensor_parallel=False):
         from h3_tp import apply_tp
         dit = MODEL.model.diffusion_model
         world = apply_tp(dit)
-        dit.to("cuda:0")
+        for name, child in dit.named_children():
+            if name != "blocks":
+                child.to("cuda:0")
         MODEL.load_device = torch.device("cuda:0")
-        MODEL.offload_device = torch.device("cuda:0")
+        MODEL.offload_device = torch.device("cpu")
         print(f"[h3-server] TP{world} applied, blocks={len(dit.blocks)}", flush=True)
     # 預設 shifts 從 model config sampling_settings 讀
     global LOADED_SHIFT_V, LOADED_SHIFT_A
@@ -144,13 +151,28 @@ def patch_sampling(model_patcher, shift_v, shift_a):
     return m
 
 
+def _to_bf16(obj):
+    """Force compute tensors to bf16. fp32 residual doubles VRAM and breaks fused RMS/RoPE."""
+    if isinstance(obj, torch.Tensor):
+        if obj.is_floating_point() and obj.dtype != torch.bfloat16:
+            return obj.to(dtype=torch.bfloat16)
+        return obj
+    if isinstance(obj, dict):
+        return {k: _to_bf16(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_bf16(v) for v in obj)
+    if type(obj).__name__ == "NestedTensor" and hasattr(obj, "tensors"):
+        return type(obj)([_to_bf16(t) for t in obj.tensors])
+    return obj
+
+
 def run_denoise(data):
     """執行一次完整採樣，回傳結果 dict（含 samples）。"""
     latent_image = data["latent_image"]
     if isinstance(latent_image, dict):
         latent_image = latent_image["samples"]
-    positive = data["positive"]
-    negative = data.get("negative") or []
+    positive = _to_bf16(data["positive"])
+    negative = _to_bf16(data.get("negative") or [])
     steps = int(data["steps"])
     cfg = float(data["cfg"])
     sampler_name = data["sampler_name"]
@@ -169,14 +191,17 @@ def run_denoise(data):
     else:
         noise = comfy.sample.prepare_noise(latent_image, seed)
 
-    def _step_cb(*_a, **_k):
-        torch.cuda.empty_cache()
+    def _cb(*_a, **_k):
+        comfy.model_management.throw_exception_if_processing_interrupted()
 
-    samples = comfy.sample.sample(
-        model, noise, steps, cfg, sampler_name, scheduler,
-        positive, negative, latent_image,
-        denoise=denoise, seed=seed, callback=_step_cb,
-    )
+    try:
+        samples = comfy.sample.sample(
+            model, noise, steps, cfg, sampler_name, scheduler,
+            positive, negative, latent_image,
+            denoise=denoise, seed=seed, callback=_cb,
+        )
+    except comfy.model_management.InterruptProcessingException as e:
+        raise RuntimeError("cancelled") from e
     elapsed = time.time() - t0
     print(f"[h3-server] denoise 完成: steps={steps} sampler={sampler_name} "
           f"scheduler={scheduler} cfg={cfg} 耗時 {elapsed:.1f}s "
@@ -193,16 +218,24 @@ def run_denoise(data):
 # HTTP 服務（FastAPI）
 # ---------------------------------------------------------------------------
 
-from fastapi import FastAPI, Request  # noqa: E402
-from fastapi.responses import Response  # noqa: E402
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
 app = FastAPI(title="MiniMax H3 Ref2VA Remote Denoise")
+_POOL = ThreadPoolExecutor(max_workers=1)
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "model": MODEL_PATH,
             "shift_video": LOADED_SHIFT_V, "shift_audio": LOADED_SHIFT_A}
+
+
+@app.post("/interrupt")
+def interrupt():
+    comfy.model_management.interrupt_current_processing(True)
+    print("[h3-server] interrupt", flush=True)
+    return {"status": "interrupted"}
 
 
 @app.post("/denoise")
@@ -212,10 +245,35 @@ async def denoise_endpoint(request: Request):
         body = await request.body()
         print(f"[h3-server] /denoise {len(body)/1e6:.1f}MB", flush=True)
         data = load_bytes(body)
-        result = run_denoise(data)
+        comfy.model_management.interrupt_current_processing(False)
+
+        async def _watch_disconnect():
+            while True:
+                if await request.is_disconnected():
+                    comfy.model_management.interrupt_current_processing(True)
+                    print("[h3-server] client disconnected, interrupt", flush=True)
+                    return
+                await asyncio.sleep(0.2)
+
+        watch = asyncio.create_task(_watch_disconnect())
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(_POOL, run_denoise, data)
+        finally:
+            watch.cancel()
         return Response(content=dump_bytes(result),
                         media_type="application/octet-stream")
-    except Exception as e:
+    except RuntimeError as e:
+        if str(e) == "cancelled":
+            print("[h3-server] denoise cancelled", flush=True)
+            return Response(content=b"cancelled", status_code=499, media_type="text/plain")
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        return Response(content=tb.encode(), status_code=500, media_type="text/plain")
+    except comfy.model_management.InterruptProcessingException:
+        print("[h3-server] denoise cancelled", flush=True)
+        return Response(content=b"cancelled", status_code=499, media_type="text/plain")
+    except Exception:
         tb = traceback.format_exc()
         print(tb, flush=True)
         return Response(content=tb.encode(), status_code=500, media_type="text/plain")

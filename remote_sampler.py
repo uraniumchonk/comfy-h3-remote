@@ -65,23 +65,52 @@ DEFAULT_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-ref2va"
 
 
 def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
-    """Send denoise request to remote H3 server (via llama-swap /upstream)."""
-    health = f"{server_url.rstrip('/')}/health"
+    """Send denoise request. Frontend Cancel posts /interrupt so the GPU box stops."""
+    import threading
+    import comfy.model_management as mm
+
+    base = server_url.rstrip("/")
+    health = f"{base}/health"
     print(f"[h3-client] waking {health}", flush=True)
     with urllib.request.urlopen(health, timeout=timeout) as resp:
         resp.read()
 
     payload = dump_bytes(data)
     req = urllib.request.Request(
-        f"{server_url.rstrip('/')}/denoise",
+        f"{base}/denoise",
         data=payload,
         headers={"Content-Type": "application/octet-stream"},
         method="POST",
     )
     t0 = time.time()
     print(f"[h3-client] Sending {len(payload)/1e6:.1f}MB to {server_url}...", flush=True)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        response_data = resp.read()
+
+    box = {"data": None, "err": None}
+
+    def _post():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                box["data"] = resp.read()
+        except Exception as e:
+            box["err"] = e
+
+    th = threading.Thread(target=_post, daemon=True)
+    th.start()
+    while th.is_alive():
+        if mm.processing_interrupted():
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(f"{base}/interrupt", method="POST"),
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            mm.throw_exception_if_processing_interrupted()
+        th.join(0.2)
+
+    if box["err"] is not None:
+        raise box["err"]
+    response_data = box["data"]
     elapsed = time.time() - t0
     print(f"[h3-client] Received {len(response_data)/1e6:.1f}MB in {elapsed:.1f}s", flush=True)
     return load_bytes(response_data)

@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
+
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("NCCL_DEBUG", "WARN")
 
 import torch
 import torch.nn as nn
@@ -86,62 +91,137 @@ def int8_linear(x, qdata, scale, input_act=None):
     )
 
 
-def _gather_row_x(xs, shards, out_device):
-    act = shards[0].input_act
-    if act == "swiglu":
-        gates, ups = [], []
-        for x in xs:
-            g, u = x.chunk(2, dim=-1)
-            gates.append(g.to(out_device, non_blocking=True))
-            ups.append(u.to(out_device, non_blocking=True))
-        return torch.cat([torch.cat(gates, dim=-1), torch.cat(ups, dim=-1)], dim=-1)
-    return torch.cat([x.to(out_device, non_blocking=True) for x in xs], dim=-1)
+def _move_shard(shard, device):
+    # Int8Shard._apply pins against dit.to(); move buffers directly.
+    dest = torch.device(device)
+    if shard.qdata.device == dest:
+        return
+    if dest.type == "cpu":
+        shard._buffers["qdata"] = shard.qdata.to("cpu").pin_memory()
+        shard._buffers["scale"] = shard.scale.to("cpu").pin_memory()
+        return
+    shard._buffers["qdata"] = shard.qdata.to(dest, non_blocking=True)
+    shard._buffers["scale"] = shard.scale.to(dest, non_blocking=True)
 
 
-def _splitk_int8_linear(x, shards, out_device, input_act=None):
-    """Quantize full-K once (ConvRot), GEMM per shard, sum. Never builds w_full."""
-    import comfy.quant_ops as qo
-    from comfy_kitchen.backends.cuda import quantize_int8_rowwise_convrot64
+def _block_shards(block):
+    return (
+        list(block.attn._h3_qkv_shards)
+        + list(block.attn._h3_out_shards)
+        + list(block.mlp._h3_fc1_shards)
+        + list(block.mlp._h3_fc2_shards)
+    )
 
+
+def place_block(block, devices, streams=None):
+    """devices: sequence of 2 device strings, or 'cpu'."""
+    groups = (
+        block.attn._h3_qkv_shards,
+        block.attn._h3_out_shards,
+        block.mlp._h3_fc1_shards,
+        block.mlp._h3_fc2_shards,
+    )
+    for shards in groups:
+        for rank, shard in enumerate(shards):
+            dest = "cpu" if devices == "cpu" else devices[rank]
+            if streams is not None and devices != "cpu":
+                with torch.cuda.device(dest), torch.cuda.stream(streams[rank]):
+                    _move_shard(shard, dest)
+            else:
+                _move_shard(shard, dest)
+    extra_dev = "cpu" if devices == "cpu" else devices[0]
+    if streams is not None and devices != "cpu":
+        with torch.cuda.device(extra_dev), torch.cuda.stream(streams[0]):
+            for m in (block.norm1, block.norm2, block.adaln_proj, block.attn.q_norm, block.attn.k_norm):
+                m.to(extra_dev, non_blocking=True)
+    else:
+        for m in (block.norm1, block.norm2, block.adaln_proj, block.attn.q_norm, block.attn.k_norm):
+            m.to(extra_dev, non_blocking=True)
+
+
+def _make_streams(devices):
+    streams = []
+    for dev in devices:
+        with torch.cuda.device(dev):
+            streams.append(torch.cuda.Stream())
+    return streams
+
+
+def _sync_streams(streams):
+    for st in streams:
+        st.synchronize()
+
+
+def _run_ranks(devices, fn):
+    """One thread per GPU. Kitchen dlpack uses stream=-1 (default stream sync),
+    so CUDA streams do not overlap; vLLM avoids this with one process per GPU."""
+    world = len(devices)
+    outs = [None] * world
+    err = [None] * world
+
+    def worker(rank, dev):
+        try:
+            with torch.cuda.device(dev):
+                outs[rank] = fn(rank, dev)
+                torch.cuda.synchronize(dev)
+        except BaseException as e:
+            err[rank] = e
+
+    threads = [threading.Thread(target=worker, args=(r, d)) for r, d in enumerate(devices)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for e in err:
+        if e is not None:
+            raise e
+    return outs
+
+
+def _nccl_broadcast(x, devices):
+    """Replicate x onto every rank via NCCL SHM (no P2P)."""
     x = x.contiguous()
-    with torch.cuda.device(out_device):
-        qx, sx = quantize_int8_rowwise_convrot64(x, CONVROT_GS, 0, input_act)
-
-    acc = None
-    k0 = 0
-    for s in shards:
-        k = s.qdata.shape[1]
-        qi = qx[:, k0:k0 + k].contiguous().to(s.qdata.device, non_blocking=True)
-        wT = s.qdata.transpose(0, 1).contiguous()
-        with torch.cuda.device(s.qdata.device):
-            part = qo.ck.mm_int8(qi, wT)
-        part = part.to(out_device, non_blocking=True)
-        if acc is None:
-            acc = part
+    xs = []
+    root = 0
+    for i, dev in enumerate(devices):
+        if x.device == torch.device(dev):
+            xs.append(x)
+            root = i
         else:
-            acc.add_(part)
-        k0 += k
-        del qi, wT, part
-
-    sw = shards[0].scale.to(device=out_device, dtype=torch.float32).reshape(1, -1)
-    y = acc.to(torch.float32).mul_(sx).mul_(sw)
-    return y.to(dtype=x.dtype)
+            xs.append(torch.empty(x.shape, dtype=x.dtype, device=dev))
+    torch.cuda.nccl.broadcast(xs, root=root)
+    return xs
 
 
-def row_gather_linear(xs, shards, out_device, chunk_m=1024):
-    """All-gather activation, split-K INT8. Chunk M so qx/workspace stay small."""
-    x_full = _gather_row_x(xs, shards, out_device)
-    act = shards[0].input_act
-    orig = x_full.shape
-    x2 = x_full.reshape(-1, orig[-1])
-    if x2.shape[0] <= chunk_m:
-        y = _splitk_int8_linear(x2, shards, out_device, act)
-        return y.reshape(*orig[:-1], y.shape[-1])
-    outs = []
-    for i in range(0, x2.shape[0], chunk_m):
-        outs.append(_splitk_int8_linear(x2[i:i + chunk_m], shards, out_device, act))
-    y = torch.cat(outs, 0)
-    return y.reshape(*orig[:-1], y.shape[-1])
+def _nccl_allreduce(parts):
+    parts = [p.contiguous() for p in parts]
+    torch.cuda.nccl.all_reduce(parts)
+    return parts
+
+
+def warmup_nccl(devices):
+    ts = [torch.zeros(8, device=d, dtype=torch.bfloat16) for d in devices]
+    torch.cuda.nccl.all_reduce(ts)
+    for d in devices:
+        torch.cuda.synchronize(d)
+
+
+def reduce_row_linear(xs, shards, out_device, streams=None):
+    """vLLM row-parallel: local INT8 GEMM + NCCL all-reduce (SHM, no P2P)."""
+    devices = [str(s.home) for s in shards]
+
+    def _one(rank, dev):
+        x = xs[rank]
+        if x.device != torch.device(dev):
+            x = x.to(dev, non_blocking=True)
+        return shards[rank](x)
+
+    parts = _run_ranks(devices, _one)
+    parts = _nccl_allreduce(parts)
+    for p in parts:
+        if p.device == torch.device(out_device):
+            return p
+    return parts[0].to(out_device)
 
 
 class Int8Shard(nn.Module):
@@ -150,6 +230,7 @@ class Int8Shard(nn.Module):
         self.register_buffer("qdata", qdata.to(device=device, non_blocking=True))
         self.register_buffer("scale", scale.to(device=device, non_blocking=True))
         self.input_act = input_act
+        self.home = torch.device(device)
 
     def _apply(self, fn, recurse=True):
         # Pin to the shard device. Comfy model_load would otherwise
@@ -165,10 +246,12 @@ def _qt_parts(linear):
     return w._qdata, w._params.scale
 
 
-def _replace_attn(attn, devices):
+def _replace_attn(attn, devices, streams=None):
     world = len(devices)
     if attn.heads % world != 0:
         raise ValueError(f"heads {attn.heads} not divisible by tp {world}")
+    if streams is None:
+        streams = _make_streams(devices)
     local_heads = attn.heads // world
     qdata, scale = _qt_parts(attn.qkv_proj)
     o_q, o_s = _qt_parts(attn.out_proj)
@@ -192,18 +275,25 @@ def _replace_attn(attn, devices):
         import comfy.model_management
         import comfy.quant_ops
 
-        s = x.shape[0]
+        seq = x.shape[0]
+        x = x.to(dtype=torch.bfloat16)
         out_device = x.device
-        local_outs = []
-        for rank, dev in enumerate(devices):
-            xr = x.to(dev, non_blocking=True)
+        xs = _nccl_broadcast(x, devices)
+        rfs = None
+        if rope_freqs is not None:
+            if rope_freqs.device != torch.device(devices[0]):
+                rope_freqs = rope_freqs.to(devices[0], non_blocking=True)
+            rfs = _nccl_broadcast(rope_freqs, devices)
+
+        def _one(rank, dev):
+            xr = xs[rank]
             qkv = qkv_shards[rank](xr)
             q, k, v = qkv.split(local_heads * head_dim, dim=-1)
-            v = v.view(s, local_heads, head_dim)
-            if rope_freqs is not None:
-                rf = rope_freqs.to(dev, non_blocking=True)
-                q = q.view(1, s, local_heads, head_dim)
-                k = k.view(1, s, local_heads, head_dim)
+            v = v.view(seq, local_heads, head_dim)
+            if rfs is not None:
+                rf = rfs[rank]
+                q = q.view(1, seq, local_heads, head_dim)
+                k = k.view(1, seq, local_heads, head_dim)
                 qw = comfy.model_management.cast_to(orig_q_norm.weight, device=dev)
                 kw = comfy.model_management.cast_to(orig_k_norm.weight, device=dev)
                 rot = rf.shape[-3] * 2
@@ -212,34 +302,36 @@ def _replace_attn(attn, devices):
                 q = q[0]
                 k = k[0]
             else:
-                import comfy.model_management
                 qw = comfy.model_management.cast_to(orig_q_norm.weight, device=dev)
                 kw = comfy.model_management.cast_to(orig_k_norm.weight, device=dev)
                 q = torch.nn.functional.rms_norm(
-                    q.view(s, local_heads, head_dim), (head_dim,), qw, orig_q_norm.eps)
+                    q.view(seq, local_heads, head_dim), (head_dim,), qw, orig_q_norm.eps)
                 k = torch.nn.functional.rms_norm(
-                    k.view(s, local_heads, head_dim), (head_dim,), kw, orig_k_norm.eps)
+                    k.view(seq, local_heads, head_dim), (head_dim,), kw, orig_k_norm.eps)
             v = v.clone()
             q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
             k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
             v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
-            local_outs.append(optimized_attention(
+            return optimized_attention(
                 q, k, v, local_heads, mask=None, skip_reshape=True,
                 transformer_options=transformer_options,
-            ).squeeze(0))
-        return row_gather_linear(local_outs, out_shards, out_device)
+            ).squeeze(0)
+
+        local_outs = _run_ranks(devices, _one)
+        return reduce_row_linear(local_outs, out_shards, out_device, streams)
 
     attn.forward = forward
     attn._h3_tp = True
     attn._h3_qkv_shards = qkv_shards
     attn._h3_out_shards = out_shards
-    # drop full replicas so they can be freed
     attn.qkv_proj.weight = nn.Parameter(torch.empty(0), requires_grad=False)
     attn.out_proj.weight = nn.Parameter(torch.empty(0), requires_grad=False)
 
 
-def _replace_mlp(mlp, devices):
+def _replace_mlp(mlp, devices, streams=None):
     world = len(devices)
+    if streams is None:
+        streams = _make_streams(devices)
     q1, s1 = _qt_parts(mlp.fc1)
     q2, s2 = _qt_parts(mlp.fc2)
     fc1_shards = []
@@ -251,11 +343,15 @@ def _replace_mlp(mlp, devices):
         fc2_shards.append(Int8Shard(rq, rs, dev, input_act="swiglu"))
 
     def forward(x):
+        x = x.to(dtype=torch.bfloat16)
         out_device = x.device
-        hs = []
-        for rank, dev in enumerate(devices):
-            hs.append(fc1_shards[rank](x.to(dev, non_blocking=True)))
-        return row_gather_linear(hs, fc2_shards, out_device)
+        xs = _nccl_broadcast(x, devices)
+
+        def _one(rank, dev):
+            return fc1_shards[rank](xs[rank])
+
+        hs = _run_ranks(devices, _one)
+        return reduce_row_linear(hs, fc2_shards, out_device, streams)
 
     mlp.forward = forward
     mlp._h3_tp = True
@@ -265,13 +361,46 @@ def _replace_mlp(mlp, devices):
     mlp.fc2.weight = nn.Parameter(torch.empty(0), requires_grad=False)
 
 
-def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1")):
+def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True):
     world = len(devices)
     if HEADS % world != 0 or FFN % world != 0 or INNER % world != 0:
         raise ValueError(f"tp={world} does not divide heads/ffn")
-    for block in diffusion_model.blocks:
-        _replace_attn(block.attn, devices)
-        _replace_mlp(block.mlp, devices)
+    streams = _make_streams(devices)
+    diffusion_model._h3_streams = streams
+    warmup_nccl(devices)
+    print("[h3-tp] NCCL SHM ready (P2P disabled, BAR1=256M)", flush=True)
+    blocks = list(diffusion_model.blocks)
+    for block in blocks:
+        _replace_attn(block.attn, devices, streams)
+        _replace_mlp(block.mlp, devices, streams)
+    if not offload:
+        return world
+
+    for block in blocks:
+        place_block(block, "cpu")
+    place_block(blocks[0], devices)
+
+    n = len(blocks)
+    copy_streams = _make_streams(devices)
+    diffusion_model._h3_copy_streams = copy_streams
+    for i, block in enumerate(blocks):
+        orig = block.forward
+
+        def _make(idx, blk, orig_fwd):
+            def wrapped(*args, **kwargs):
+                _sync_streams(copy_streams)
+                place_block(blk, devices)
+                nxt = blocks[idx + 1] if idx + 1 < n else blocks[0]
+                if nxt is not blk:
+                    place_block(nxt, devices, copy_streams)
+                try:
+                    return orig_fwd(*args, **kwargs)
+                finally:
+                    _sync_streams(streams)
+                    place_block(blk, "cpu")
+            return wrapped
+
+        block.forward = _make(i, block, orig)
     return world
 
 
@@ -343,7 +472,7 @@ def verify_layer(name, qdata, scale, kind, devices, seq=64):
         qw, qs_ = shard_row(qdata, scale, idx)
         xs.append(x.index_select(-1, idx.to(x.device)).to(dev))
         shards.append(Int8Shard(qw, qs_, dev))
-    got = row_gather_linear(xs, shards, devices[0])
+    got = reduce_row_linear(xs, shards, devices[0])
     return {"vs_full": _max_err(got, ref)}
 
 
