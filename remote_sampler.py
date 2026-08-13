@@ -16,6 +16,12 @@ import urllib.error
 
 import torch
 
+try:
+    import folder_paths
+    _LORA_LIST = ["None"] + list(folder_paths.get_filename_list("loras"))
+except Exception:
+    _LORA_LIST = ["None"]
+
 # ---------------------------------------------------------------------------
 # Serialization helpers (matching h3_server.py)
 # ---------------------------------------------------------------------------
@@ -231,6 +237,8 @@ class RemoteDenoiseNode:
             },
             "optional": {
                 "negative": ("CONDITIONING", {}),
+                "lora_name": (_LORA_LIST, {"default": "None"}),
+                "lora_strength": ("FLOAT", {"default": 0.9, "min": -2.0, "max": 2.0, "step": 0.05}),
             },
         }
 
@@ -239,7 +247,8 @@ class RemoteDenoiseNode:
     CATEGORY = "MiniMax H3"
 
     def denoise(self, latent_image, positive, steps, cfg, sampler_name, scheduler,
-                seed, denoise, shift_video, shift_audio, server_url, negative=None):
+                seed, denoise, shift_video, shift_audio, server_url, negative=None,
+                lora_name="None", lora_strength=0.9):
         data = {
             "latent_image": latent_image,
             "positive": positive,
@@ -254,5 +263,7 @@ class RemoteDenoiseNode:
             "shift_audio": shift_audio,
             "disable_noise": False,
         }
+        if lora_name and lora_name != "None":
+            data["loras"] = [{"name": lora_name, "strength": float(lora_strength)}]
         result = send_denoise_request(data, server_url)
         return ({"samples": result["samples"]},)
