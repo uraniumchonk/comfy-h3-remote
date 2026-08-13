@@ -22,13 +22,12 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size
 
 import torch
 
-# sys.path:
-#   1. 本檔同目錄 → import h3_tp（TP shard）
-#   2. COMFYUI_ROOT 環境變數 → ComfyUI 本體（comfy/ 不進 Git）
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-comfyui_root = os.environ.get("COMFYUI_ROOT")
-if comfyui_root:
-    sys.path.insert(0, comfyui_root)
+# Same dir: h3_tp.py. COMFYUI_ROOT: ComfyUI checkout (0.30+ MiniMax H3 + kitchen).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+_comfy = os.environ.get("COMFYUI_ROOT") or os.environ.get("PYTHONPATH", "").split(os.pathsep)[0]
+if _comfy:
+    sys.path.insert(0, _comfy)
 
 import comfy  # noqa: E402
 import comfy.nested_tensor  # noqa: E402

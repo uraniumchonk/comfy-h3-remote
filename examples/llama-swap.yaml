@@ -1,16 +1,13 @@
-# llama-swap config 片段：只放 minimax-h3-ref2va 這段
-# 併進 llama-swap 的 models: 底下，${PORT} 由 llama-swap 分配。
-# COMFYUI_ROOT 指向 ComfyUI 本體（comfy/ 不在本 repo）。
 models:
   minimax-h3-ref2va:
     env:
       - "CUDA_VISIBLE_DEVICES=0,1"
       - "CUDA_DEVICE_ORDER=PCI_BUS_ID"
       - "COMFYUI_ROOT=/path/to/ComfyUI"
-      - "PYTHONPATH=/path/to/comfy-h3-remote/server"
-      - "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128"
+      - "PYTHONPATH=/path/to/ComfyUI"
+      - "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:64"
     cmd: |
-      /path/to/venv/bin/python /path/to/comfy-h3-remote/server/h3_server.py \
+      /path/to/ComfyUI/.venv/bin/python3 /path/to/comfy-h3-remote/server/h3_server.py \
         --model /path/to/minimax_h3_ref2va_pruned_int8_convrot.safetensors \
         --tp \
         --host 127.0.0.1 \
@@ -25,3 +22,6 @@ models:
       tlsHandshake: 10
       idleConn: 7200
     name: "MiniMax H3 Ref2VA INT8 TP2"
+
+aliases:
+  h3: minimax-h3-ref2va

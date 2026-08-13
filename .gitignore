@@ -1,4 +1,10 @@
-.venv
-models
-__pycache__
+.venv/
+venv/
+models/
+__pycache__/
+*.py[cod]
 *.safetensors
+*.pt
+*.pth
+*.gguf
+.DS_Store
