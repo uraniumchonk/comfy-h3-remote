@@ -480,12 +480,13 @@ def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True, reside
         place_block(blocks[resident], devices)
 
     for i, block in enumerate(blocks):
-        if i < resident:
-            continue
         orig = block.forward
+        block._h3_resident = i < resident
 
         def _make(idx, blk, orig_fwd):
             def wrapped(*args, **kwargs):
+                if blk._h3_resident:
+                    return orig_fwd(*args, **kwargs)
                 _sync_streams(copy_streams)
                 place_block(blk, devices)
                 if idx + 1 < n:
@@ -514,6 +515,31 @@ def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True, reside
         used.append(f"{d}={(total - free) / 1e9:.1f}G")
     print(f"[h3-tp] resident={resident} offload={n - resident} {' '.join(used)}", flush=True)
     return world
+
+
+def set_resident(diffusion_model, resident, devices=("cuda:0", "cuda:1")):
+    """Re-tune the resident prefix after load. Call per request with a
+    seq-derived resident count; cheap (one H2D pass over changed blocks)."""
+    blocks = list(diffusion_model.blocks)
+    n = len(blocks)
+    resident = max(0, min(int(resident), n))
+    copy_streams = getattr(diffusion_model, "_h3_copy_streams", None)
+    if copy_streams is None:
+        copy_streams = _make_streams(devices)
+        diffusion_model._h3_copy_streams = copy_streams
+    for i, block in enumerate(blocks):
+        want = i < resident
+        if getattr(block, "_h3_resident", False) == want:
+            continue
+        block._h3_resident = want
+        if want:
+            place_block(block, devices)
+        else:
+            place_block(block, "cpu")
+    if resident < n:
+        place_block(blocks[resident], devices)
+    print(f"[h3-tp] set_resident={resident}", flush=True)
+    return resident
 
 
 def _max_err(a, b):

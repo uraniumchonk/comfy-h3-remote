@@ -158,6 +158,40 @@ def _to_bf16(obj):
     return obj
 
 
+def _estimate_seq(data):
+    """Packed seq estimate from the request: video rows (patch 2x2) + text tokens.
+
+    video latent [1, 24, T, H, W] -> T*(H//2)*(W//2) rows; audio/ref rows are
+    small next to video and ignored (conservative: over-estimates workspace).
+    """
+    latent = data.get("latent_image")
+    if isinstance(latent, dict):
+        latent = latent.get("samples")
+    seq = 1024  # floor: text + pads
+    if latent is not None and getattr(latent, "ndim", 0) == 5:
+        _, _, t, h, w = latent.shape
+        seq += t * (h // 2) * (w // 2)
+    pos = data.get("positive")
+    if isinstance(pos, list) and pos:
+        c = pos[0]
+        if isinstance(c, dict) and "tokens" in c:
+            seq += int(c["tokens"].shape[1]) if hasattr(c["tokens"], "shape") else 0
+        elif isinstance(c, dict) and "pooled_output" in c and c["pooled_output"] is not None:
+            seq += int(c["pooled_output"].shape[-1]) // 8
+    return seq
+
+
+def _pick_resident_for_seq(seq, devices, n_blocks=50):
+    """Attention workspace ~ O(seq^2) per card (28 local heads, bf16 scores).
+    Keep 10GB headroom for embed/refiner/final + CFG slack."""
+    free0, _ = torch.cuda.mem_get_info(torch.device(devices[0]).index)
+    scores = (seq ** 2) * 28 * 2          # bf16 [S,S] per local head
+    headroom = 6 * 1024 ** 3              # leftovers + activations + slack
+    per_layer = 220 * 1024 ** 2
+    cap = max(0, int((free0 - scores - headroom) / per_layer))
+    return max(0, min(12, cap, n_blocks))
+
+
 def run_denoise(data):
     """執行一次完整採樣，回傳結果 dict（含 samples）。"""
     latent_image = data["latent_image"]
@@ -176,6 +210,18 @@ def run_denoise(data):
     disable_noise = bool(data.get("disable_noise", False))
 
     model = patch_sampling(MODEL, shift_v, shift_a)
+
+    # dynamic resident: small payload -> short seq -> small attention workspace
+    # -> keep more blocks resident and skip H2D for them.
+    if getattr(MODEL.model.diffusion_model, "_h3_resident", None) is not None:
+        try:
+            from h3_tp import set_resident
+            seq = _estimate_seq(data)
+            resident = _pick_resident_for_seq(seq, ("cuda:0", "cuda:1"))
+            set_resident(MODEL.model.diffusion_model, resident)
+            print(f"[h3-server] seq~{seq} resident={resident}", flush=True)
+        except Exception as e:
+            print(f"[h3-server] dynamic resident skipped: {e}", flush=True)
 
     t0 = time.time()
     last = t0
