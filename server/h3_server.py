@@ -79,6 +79,9 @@ def load_bytes(b):
 # ---------------------------------------------------------------------------
 
 MODEL = None          # base ModelPatcher（未 clone）
+PROGRESS = {
+    "step": 0, "total": 0, "step_s": 0.0, "elapsed": 0.0, "status": "idle",
+}
 MODEL_PATH = None
 LOADED_SHIFT_V = 12.0
 LOADED_SHIFT_A = 3.0
@@ -262,6 +265,7 @@ def run_denoise(data):
 
     t0 = time.time()
     last = t0
+    PROGRESS.update(step=0, total=steps, step_s=0.0, elapsed=0.0, status="running")
     print(f"[h3-server] step 0/{steps} start sampler={sampler_name}", flush=True)
 
     def _cb(step=None, *_a, **_k):
@@ -277,7 +281,9 @@ def run_denoise(data):
             i = 0
             total = steps
         now = time.time()
-        print(f"[h3-server] step {i}/{total}  {now - last:.1f}s  elapsed {now - t0:.1f}s", flush=True)
+        step_s = now - last
+        print(f"[h3-server] step {i}/{total}  {step_s:.1f}s  elapsed {now - t0:.1f}s", flush=True)
+        PROGRESS.update(step=i, total=total, step_s=step_s, elapsed=now - t0, status="running")
         last = now
 
     if disable_noise:
@@ -293,6 +299,7 @@ def run_denoise(data):
             denoise=denoise, seed=seed, callback=_cb, disable_pbar=True,
         )
     except comfy.model_management.InterruptProcessingException as e:
+        PROGRESS["status"] = "cancelled"
         raise RuntimeError("cancelled") from e
     finally:
         del model, noise, positive, negative, latent_image, data
@@ -301,6 +308,7 @@ def run_denoise(data):
             with torch.cuda.device(i):
                 torch.cuda.empty_cache()
     elapsed = time.time() - t0
+    PROGRESS.update(step=steps, total=steps, elapsed=elapsed, status="done")
     print(f"[h3-server] denoise 完成: steps={steps} sampler={sampler_name} "
           f"scheduler={scheduler} cfg={cfg} 耗時 {elapsed:.1f}s "
           f"({elapsed / max(steps,1):.2f}s/step)", flush=True)
@@ -323,6 +331,11 @@ _POOL = ThreadPoolExecutor(max_workers=1)
 def health():
     return {"status": "ok", "model": MODEL_PATH,
             "shift_video": LOADED_SHIFT_V, "shift_audio": LOADED_SHIFT_A}
+
+
+@app.get("/progress")
+def progress():
+    return dict(PROGRESS)
 
 
 @app.post("/interrupt")
