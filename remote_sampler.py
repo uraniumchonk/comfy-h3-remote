@@ -22,6 +22,17 @@ try:
 except Exception:
     _LORA_LIST = ["None"]
 
+try:
+    import comfy.samplers as _cs
+    _SAMPLERS = list(_cs.KSampler.SAMPLERS)
+    _SCHEDULERS = list(_cs.KSampler.SCHEDULERS)
+except Exception:
+    _SAMPLERS = [
+        "euler", "res_multistep", "euler_ancestral", "dpmpp_2m",
+        "dpmpp_2s_ancestral", "dpmpp_sde", "ddim", "lms", "heun", "uni_pc",
+    ]
+    _SCHEDULERS = ["simple", "normal", "karras", "exponential", "sgm_uniform", "beta"]
+
 # ---------------------------------------------------------------------------
 # Serialization helpers (matching h3_server.py)
 # ---------------------------------------------------------------------------
@@ -212,15 +223,8 @@ class RemoteDenoiseNode:
                 "positive": ("CONDITIONING", {}),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 100, "step": 1}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "sampler_name": (
-                    ["euler", "res_multistep", "euler_ancestral", "dpmpp_2m",
-                     "dpmpp_2s_ancestral", "dpmpp_sde", "ddim", "lms", "heun"],
-                    {"default": "res_multistep"},
-                ),
-                "scheduler": (
-                    ["simple", "normal", "karras", "exponential", "sgm_uniform"],
-                    {"default": "simple"},
-                ),
+                "sampler_name": (_SAMPLERS, {"default": "res_multistep"}),
+                "scheduler": (_SCHEDULERS, {"default": "simple"}),
                 "seed": ("INT", {
                     "default": 0,
                     "min": 0,
