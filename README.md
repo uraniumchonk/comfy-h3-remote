@@ -1,3 +1,8 @@
+> **⚠️ Still under active development. Not ready for use.**
+>
+> This project is currently experimental. The architecture, node interface, and communication protocol may change significantly at any time.  
+> It is not guaranteed to work, and is not recommended for any production or serious workflows.  
+
 # ComfyUI Remote Denoise (MiniMax H3)
 
 客戶端只跑 CLIP / VAE / Ref2VA 編碼。Ref2VA DiT 在遠端 GPU（可掛 llama-swap 跟 LLM 互斥換卡）。
