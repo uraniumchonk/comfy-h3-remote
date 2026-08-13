@@ -130,13 +130,68 @@ def place_block(block, devices, streams=None):
             else:
                 _move_shard(shard, dest)
     extra_dev = "cpu" if devices == "cpu" else devices[0]
+    extras = (block.norm1, block.norm2, block.attn.q_norm, block.attn.k_norm)
     if streams is not None and devices != "cpu":
         with torch.cuda.device(extra_dev), torch.cuda.stream(streams[0]):
-            for m in (block.norm1, block.norm2, block.adaln_proj, block.attn.q_norm, block.attn.k_norm):
+            for m in extras:
                 m.to(extra_dev, non_blocking=True)
     else:
-        for m in (block.norm1, block.norm2, block.adaln_proj, block.attn.q_norm, block.attn.k_norm):
+        for m in extras:
             m.to(extra_dev, non_blocking=True)
+    block.adaln_proj.to("cpu")
+
+
+def _park_adaln(adaln):
+    """AdaLN is ~0.5-1GB per block. Keep on CPU; gates are tiny."""
+    if getattr(adaln, "_h3_cpu", False):
+        return
+    orig = adaln.forward
+
+    def fwd(t_emb):
+        dev, dt = t_emb.device, t_emb.dtype
+        chunks = orig(t_emb.to(device="cpu"))
+        return tuple(c.to(device=dev, dtype=dt, non_blocking=True) for c in chunks)
+
+    adaln.forward = fwd
+    adaln._h3_cpu = True
+    adaln.to("cpu")
+
+
+def park_cpu_modules(dit):
+    for block in dit.blocks:
+        _park_adaln(block.adaln_proj)
+    if hasattr(dit, "final_layer"):
+        _park_adaln(dit.final_layer.adaln_proj)
+
+
+def place_leftovers(dit, device="cuda:0"):
+    """Unsharded bits (refiner/patch/embed) stay on the residual device.
+
+    Must run before _pick_resident: otherwise both cards look empty and we
+    pin too many prefix layers onto cuda:0.
+    """
+    for name, child in dit.named_children():
+        if name == "blocks":
+            continue
+        child.to(device)
+    park_cpu_modules(dit)
+
+
+def _pick_resident(n, devices, default=None):
+    """Size the prefix from cuda:0 free space after leftovers are placed.
+
+    Long video-ref + CFG concat needs a multi-GB attention workspace on
+    device 0 (694MB / 1GB / 2.7GB retries in the last crash). 20GB cards
+    cannot keep 12 resident layers and that workspace at once.
+    """
+    idx0 = torch.device(devices[0]).index
+    free0, total0 = torch.cuda.mem_get_info(idx0)
+    if default is None:
+        default = 12 if total0 >= 22 * 1024 ** 3 else 4
+    reserve = 10 * 1024 ** 3
+    per = 220 * 1024 ** 2
+    cap = max(0, int((free0 - reserve) / per))
+    return max(0, min(default, cap, n))
 
 
 def _make_streams(devices):
@@ -225,12 +280,12 @@ def reduce_row_linear(xs, shards, out_device, streams=None):
 
 
 class Int8Shard(nn.Module):
-    def __init__(self, qdata, scale, device, input_act=None):
+    def __init__(self, qdata, scale, device, input_act=None, home=None):
         super().__init__()
         self.register_buffer("qdata", qdata.to(device=device, non_blocking=True))
         self.register_buffer("scale", scale.to(device=device, non_blocking=True))
         self.input_act = input_act
-        self.home = torch.device(device)
+        self.home = torch.device(home if home is not None else device)
 
     def _apply(self, fn, recurse=True):
         # Pin to the shard device. Comfy model_load would otherwise
@@ -246,7 +301,7 @@ def _qt_parts(linear):
     return w._qdata, w._params.scale
 
 
-def _replace_attn(attn, devices, streams=None):
+def _replace_attn(attn, devices, streams=None, shard_dev=None):
     world = len(devices)
     if attn.heads % world != 0:
         raise ValueError(f"heads {attn.heads} not divisible by tp {world}")
@@ -258,10 +313,11 @@ def _replace_attn(attn, devices, streams=None):
     qkv_shards = []
     out_shards = []
     for rank, dev in enumerate(devices):
+        place = shard_dev if shard_dev is not None else dev
         q, s = shard_column(qdata, scale, qkv_col_index(rank, world))
-        qkv_shards.append(Int8Shard(q, s, dev))
+        qkv_shards.append(Int8Shard(q, s, place, home=dev))
         rq, rs = shard_row(o_q, o_s, row_index(rank, world, o_q.shape[1]))
-        out_shards.append(Int8Shard(rq, rs, dev))
+        out_shards.append(Int8Shard(rq, rs, place, home=dev))
 
     orig_q_norm = attn.q_norm
     orig_k_norm = attn.k_norm
@@ -328,7 +384,7 @@ def _replace_attn(attn, devices, streams=None):
     attn.out_proj.weight = nn.Parameter(torch.empty(0), requires_grad=False)
 
 
-def _replace_mlp(mlp, devices, streams=None):
+def _replace_mlp(mlp, devices, streams=None, shard_dev=None):
     world = len(devices)
     if streams is None:
         streams = _make_streams(devices)
@@ -337,10 +393,11 @@ def _replace_mlp(mlp, devices, streams=None):
     fc1_shards = []
     fc2_shards = []
     for rank, dev in enumerate(devices):
+        place = shard_dev if shard_dev is not None else dev
         q, s = shard_column(q1, s1, swiglu_col_index(rank, world))
-        fc1_shards.append(Int8Shard(q, s, dev))
+        fc1_shards.append(Int8Shard(q, s, place, home=dev))
         rq, rs = shard_row(q2, s2, row_index(rank, world, q2.shape[1]))
-        fc2_shards.append(Int8Shard(rq, rs, dev, input_act="swiglu"))
+        fc2_shards.append(Int8Shard(rq, rs, place, home=dev, input_act="swiglu"))
 
     def forward(x):
         x = x.to(dtype=torch.bfloat16)
@@ -361,7 +418,7 @@ def _replace_mlp(mlp, devices, streams=None):
     mlp.fc2.weight = nn.Parameter(torch.empty(0), requires_grad=False)
 
 
-def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True):
+def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True, resident=None):
     world = len(devices)
     if HEADS % world != 0 or FFN % world != 0 or INNER % world != 0:
         raise ValueError(f"tp={world} does not divide heads/ffn")
@@ -371,28 +428,43 @@ def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True):
     print("[h3-tp] NCCL SHM ready (P2P disabled, BAR1=256M)", flush=True)
     blocks = list(diffusion_model.blocks)
     for block in blocks:
-        _replace_attn(block.attn, devices, streams)
-        _replace_mlp(block.mlp, devices, streams)
+        _replace_attn(block.attn, devices, streams, shard_dev="cpu")
+        _replace_mlp(block.mlp, devices, streams, shard_dev="cpu")
+    place_leftovers(diffusion_model, devices[0])
     if not offload:
+        for block in blocks:
+            place_block(block, devices)
         return world
 
-    for block in blocks:
-        place_block(block, "cpu")
-    place_block(blocks[0], devices)
-
     n = len(blocks)
+    if resident is None:
+        resident = _pick_resident(n, devices)
+    else:
+        resident = max(0, min(int(resident), n))
     copy_streams = _make_streams(devices)
     diffusion_model._h3_copy_streams = copy_streams
+
     for i, block in enumerate(blocks):
+        if i < resident:
+            place_block(block, devices)
+        else:
+            place_block(block, "cpu")
+    if resident < n:
+        place_block(blocks[resident], devices)
+
+    for i, block in enumerate(blocks):
+        if i < resident:
+            continue
         orig = block.forward
 
         def _make(idx, blk, orig_fwd):
             def wrapped(*args, **kwargs):
                 _sync_streams(copy_streams)
                 place_block(blk, devices)
-                nxt = blocks[idx + 1] if idx + 1 < n else blocks[0]
-                if nxt is not blk:
-                    place_block(nxt, devices, copy_streams)
+                if idx + 1 < n:
+                    place_block(blocks[idx + 1], devices, copy_streams)
+                elif resident < n:
+                    place_block(blocks[resident], devices, copy_streams)
                 try:
                     return orig_fwd(*args, **kwargs)
                 finally:
@@ -401,6 +473,11 @@ def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True):
             return wrapped
 
         block.forward = _make(i, block, orig)
+    used = []
+    for d in devices:
+        free, total = torch.cuda.mem_get_info(torch.device(d).index)
+        used.append(f"{d}={(total - free) / 1e9:.1f}G")
+    print(f"[h3-tp] resident={resident} offload={n - resident} {' '.join(used)}", flush=True)
     return world
 
 
