@@ -7,14 +7,14 @@
 
 ## 目標
 
-讓 ComfyUI 能跑 MiniMax H3 Ref2VA 的 denoise，但 DiT 用自寫的多卡 tensor parallel（TP2 / TP4）執行，不走 vLLM-omni 整包載入完整 BF16 模型的路線。客戶端只跑 CLIP / VAE / Ref2VA 編碼，DiT 在遠端 GPU box 上切卡跑，denoise 完的 latent 送回客戶端解碼。
+讓 ComfyUI 能跑 MiniMax H3 Ref2VA 的 denoise，並用上多卡 tensor parallel（TP2 / TP4）加速。現在玩本地 LLM 的人都會有一台多卡 GPU 伺服器，這台機器除了跑 LLM，也能拿來跑 ComfyUI 生成影片這種計算量超重的模型，享受多卡加速。客戶端只跑 CLIP / VAE / Ref2VA 編碼，DiT 在遠端 GPU box 上切卡跑，denoise 完的 latent 送回客戶端解碼。
 
 ## 解決的痛點
 
-- **ComfyUI 原生沒有多卡 TP**：ComfyUI 的 DiT 預設只能單卡跑，MiniMax H3 Ref2VA 的 DiT 單卡裝不下。`server/h3_tp.py` 自寫 Megatron-style TP：qkv / fc1 走 column-parallel（QKV / SwiGLU 用 index map，不是對半切），out / fc2 走 row-parallel + all-reduce，2 卡或 4 卡都能切，50 個 DiT block 均勻散到各卡。
-- **不用 vLLM-omni 跑超大完整 BF16**：整包 BF16 模型要靠 vLLM-omni 這類方案，需要極多張大卡。這裡用 INT8+ConvRot 量化 + TP，2× RTX 3080 20GB 就能跑短片。
+- **ComfyUI 原生沒有多卡 TP**：單卡其實跑得了 MiniMax H3 Ref2VA，但手上有 2 / 4 卡伺服器的人，卡閒著也是閒著——影片生成計算量超重，正是多卡加速最有價值的地方。ComfyUI 的 DiT 預設只能單卡跑，多卡 TP 這個功能原生根本沒有。`server/h3_tp.py` 自寫 Megatron-style TP：qkv / fc1 走 column-parallel（QKV / SwiGLU 用 index map，不是對半切），out / fc2 走 row-parallel + all-reduce，2 卡或 4 卡都能切，50 個 DiT block 均勻散到各卡。
+- **不用 vLLM-omni 跑超大完整 BF16**：別條路線是整包 BF16 模型丟 vLLM-omni，需要極多張大卡。這裡用 INT8+ConvRot 量化 + TP，2× RTX 3080 20GB 就能跑短片。
 - **接線簡化（附帶）**：官方模板要接 `UNETLoader → BasicGuider`、`RandomNoise + KSamplerSelect + BasicScheduler → SamplerCustomAdvanced` 一串節點，客戶端還得載 UNET。這個節點把整段收成一個，客戶端不載 UNET、不碰採樣器。
-- **GPU 共享（附帶）**：GPU box 可掛 llama-swap，跟 LLM 互斥換卡。H3 要跑時才載入，平時卡留給 vLLM / LLM，不用為 H3 留一台專用機。
+- **GPU 共享（附帶）**：GPU box 可掛 llama-swap，跟 LLM 互斥換卡。H3 要跑時才載入，平時卡留給 vLLM / LLM，一台機器兩種用途。
 
 ## 客戶端
 
