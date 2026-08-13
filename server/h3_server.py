@@ -213,7 +213,8 @@ def run_denoise(data):
 
     # dynamic resident: small payload -> short seq -> small attention workspace
     # -> keep more blocks resident and skip H2D for them.
-    if getattr(MODEL.model.diffusion_model, "_h3_resident", None) is not None:
+    dit = MODEL.model.diffusion_model
+    if getattr(dit, "blocks", None) and getattr(dit.blocks[0], "_h3_resident", None) is not None:
         try:
             from h3_tp import set_resident
             seq = _estimate_seq(data)
