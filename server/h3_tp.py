@@ -24,6 +24,25 @@ WEIGHT = os.path.join(
     "models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
 )
 
+H3_PROFILE = os.environ.get("H3_PROFILE") == "1"
+_PROFILE_STEP = {"layer_s": 0.0, "layer_n": 0, "bcast_s": 0.0, "bcast_n": 0,
+                 "reduce_s": 0.0, "reduce_n": 0, "h2d_s": 0.0, "h2d_n": 0}
+
+
+def profile_reset():
+    for k in _PROFILE_STEP:
+        _PROFILE_STEP[k] = 0.0 if k.endswith("_s") else 0
+
+
+def profile_report():
+    if _PROFILE_STEP["layer_n"] == 0:
+        return "(no profile data)"
+    p = _PROFILE_STEP
+    return (f"blocks={p['layer_s']:.1f}s({p['layer_n']}L,{p['layer_s']/p['layer_n']*1000:.0f}ms/L) "
+            f"h2d={p['h2d_s']:.1f}s({p['h2d_s']/max(1,p['h2d_n'])*1000:.0f}ms) "
+            f"bcast={p['bcast_s']:.2f}s({p['bcast_s']/max(1,p['bcast_n'])*1000:.0f}ms) "
+            f"reduce={p['reduce_s']:.2f}s({p['reduce_s']/max(1,p['reduce_n'])*1000:.0f}ms)")
+
 HEADS = 56
 HEAD_DIM = 128
 INNER = HEADS * HEAD_DIM          # 7168
@@ -194,33 +213,6 @@ def _pick_resident(n, devices, default=None):
     return max(0, min(default, cap, n))
 
 
-def split_packed_seq(h, rope_freqs, mod_segments, rank, world):
-    """Raylight-style sequence split: local h + local rope + local segments.
-
-    h: [S, H], rope_freqs: [S, R] (or [1, S, R]), mod_segments: [(a,b,row)].
-    Returns (h_local, rope_local, segments_local) for this rank.
-    """
-    s = h.shape[0]
-    local = s // world
-    start = rank * local
-    end = start + local
-    segs_local = []
-    for a, b, row in mod_segments:
-        a2 = max(a, start)
-        b2 = min(b, end)
-        if a2 < b2:
-            segs_local.append((a2 - start, b2 - start, row))
-    h_local = h[start:end].contiguous()
-    if rope_freqs is not None:
-        if rope_freqs.dim() == 2:
-            rope_local = rope_freqs[start:end].contiguous()
-        else:
-            rope_local = rope_freqs[:, start:end].contiguous()
-    else:
-        rope_local = None
-    return h_local, rope_local, segs_local
-
-
 def _make_streams(devices):
     streams = []
     for dev in devices:
@@ -262,6 +254,7 @@ def _run_ranks(devices, fn):
 
 def _nccl_broadcast(x, devices):
     """Replicate x onto every rank via NCCL SHM (no P2P)."""
+    t0 = time.perf_counter()
     x = x.contiguous()
     xs = []
     root = 0
@@ -272,12 +265,19 @@ def _nccl_broadcast(x, devices):
         else:
             xs.append(torch.empty(x.shape, dtype=x.dtype, device=dev))
     torch.cuda.nccl.broadcast(xs, root=root)
+    if H3_PROFILE:
+        _PROFILE_STEP["bcast_s"] += time.perf_counter() - t0
+        _PROFILE_STEP["bcast_n"] += 1
     return xs
 
 
 def _nccl_allreduce(parts):
+    t0 = time.perf_counter()
     parts = [p.contiguous() for p in parts]
     torch.cuda.nccl.all_reduce(parts)
+    if H3_PROFILE:
+        _PROFILE_STEP["reduce_s"] += time.perf_counter() - t0
+        _PROFILE_STEP["reduce_n"] += 1
     return parts
 
 
@@ -492,9 +492,17 @@ def apply_tp(diffusion_model, devices=("cuda:0", "cuda:1"), offload=True, reside
                     place_block(blocks[idx + 1], devices, copy_streams)
                 elif resident < n:
                     place_block(blocks[resident], devices, copy_streams)
+                ev0 = torch.cuda.Event(enable_timing=True)
+                with torch.cuda.device(devices[0]):
+                    ev0.record()
                 try:
                     return orig_fwd(*args, **kwargs)
                 finally:
+                    with torch.cuda.device(devices[0]):
+                        ev0.synchronize()
+                    if H3_PROFILE:
+                        _PROFILE_STEP["layer_s"] += ev0.elapsed_time(ev0) / 1000.0
+                        _PROFILE_STEP["layer_n"] += 1
                     _sync_streams(streams)
                     place_block(blk, "cpu")
             return wrapped
