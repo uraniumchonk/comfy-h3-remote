@@ -27,12 +27,7 @@ os.environ.setdefault("NCCL_DEBUG", "WARN")
 
 import torch
 
-# Same dir: h3_tp.py. COMFYUI_ROOT: ComfyUI checkout (0.30+ MiniMax H3 + kitchen).
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _HERE)
-_comfy = os.environ.get("COMFYUI_ROOT") or os.environ.get("PYTHONPATH", "").split(os.pathsep)[0]
-if _comfy:
-    sys.path.insert(0, _comfy)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import comfy  # noqa: E402
 import comfy.nested_tensor  # noqa: E402
@@ -108,9 +103,6 @@ def load_model(path, tensor_parallel=False):
         from h3_tp import apply_tp
         dit = MODEL.model.diffusion_model
         world = apply_tp(dit)
-        for name, child in dit.named_children():
-            if name != "blocks":
-                child.to("cuda:0")
         MODEL.load_device = torch.device("cuda:0")
         MODEL.offload_device = torch.device("cpu")
         print(f"[h3-server] TP{world} applied, blocks={len(dit.blocks)}", flush=True)
@@ -186,30 +178,49 @@ def run_denoise(data):
     model = patch_sampling(MODEL, shift_v, shift_a)
 
     t0 = time.time()
+    last = t0
+    print(f"[h3-server] step 0/{steps} start sampler={sampler_name}", flush=True)
+
+    def _cb(step=None, *_a, **_k):
+        nonlocal last
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        if isinstance(step, dict):
+            i = int(step.get("i", 0)) + 1
+            total = steps
+        elif step is not None:
+            i = int(step) + 1
+            total = int(_a[2]) if len(_a) >= 3 else steps
+        else:
+            i = 0
+            total = steps
+        now = time.time()
+        print(f"[h3-server] step {i}/{total}  {now - last:.1f}s  elapsed {now - t0:.1f}s", flush=True)
+        last = now
+
     if disable_noise:
         noise = comfy.sample.prepare_empty_noise(latent_image)
     else:
         noise = comfy.sample.prepare_noise(latent_image, seed)
 
-    def _cb(*_a, **_k):
-        comfy.model_management.throw_exception_if_processing_interrupted()
-
+    samples = None
     try:
         samples = comfy.sample.sample(
             model, noise, steps, cfg, sampler_name, scheduler,
             positive, negative, latent_image,
-            denoise=denoise, seed=seed, callback=_cb,
+            denoise=denoise, seed=seed, callback=_cb, disable_pbar=True,
         )
     except comfy.model_management.InterruptProcessingException as e:
         raise RuntimeError("cancelled") from e
+    finally:
+        del model, noise, positive, negative, latent_image, data
+        gc.collect()
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
     elapsed = time.time() - t0
     print(f"[h3-server] denoise 完成: steps={steps} sampler={sampler_name} "
           f"scheduler={scheduler} cfg={cfg} 耗時 {elapsed:.1f}s "
           f"({elapsed / max(steps,1):.2f}s/step)", flush=True)
-
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
 
     return {"samples": samples}
 

@@ -1,8 +1,3 @@
-> **⚠️ Still under active development. Not ready for use.**
->
-> This project is currently experimental. The architecture, node interface, and communication protocol may change significantly at any time.  
-> It is not guaranteed to work, and is not recommended for any production or serious workflows.  
-
 # ComfyUI Remote Denoise (MiniMax H3)
 
 ## Goal
@@ -13,6 +8,8 @@ Run MiniMax H3 Ref2VA denoise inside ComfyUI with multi-GPU tensor parallelism (
 
 - **ComfyUI has no multi-GPU TP out of the box**: MiniMax H3 Ref2VA actually fits on a single GPU, but if you own a 2 / 4-GPU server, those idle cards are wasted potential — video generation is extremely compute-heavy, exactly where multi-GPU acceleration pays off the most. ComfyUI DiTs only run on one GPU by default; multi-GPU TP simply doesn't exist natively. `server/h3_tp.py` implements Megatron-style TP from scratch: qkv / fc1 are column-parallel (QKV / SwiGLU use index maps, not naive half-splits), out / fc2 are row-parallel with all-reduce, and it scales to 2 or 4 cards with all 50 DiT blocks evenly spread across them.
 - **No vLLM-omni, no giant full BF16 models**: the alternative route is dumping the full BF16 model into vLLM-omni, which needs a huge number of big cards. This project uses INT8+ConvRot quantization + TP instead, so 2× RTX 3080 20GB is enough for short clips.
+- **NCCL without P2P**: these cards have no NVLink and BAR1 is only 256MiB (`can_device_access_peer` = False), so P2P is impossible. `torch.cuda.nccl` falls back to SHM / direct host staging — measured 0.76ms for a 2M-element all-reduce and broadcast is ~2× faster than `.to()`. The server disables P2P / IB at startup and warms up one communicator at load time.
+- **Block-wise CPU offload (Comfy lowvram / Wan2GP / Omni DLO style)**: 50 blocks stay in pinned RAM; while layer *i* computes, layer *i+1* is prefetched onto the cards. The first `resident` layers (auto-sized from free VRAM) stay resident to cut the per-layer PCIe sync. AdaLN projections (0.5–1GB each) stay on CPU — only the few-KB gates cross.
 - **Simplified wiring (bonus)**: the official template requires a chain of nodes — `UNETLoader → BasicGuider`, `RandomNoise + KSamplerSelect + BasicScheduler → SamplerCustomAdvanced` — and the client has to load UNET. This node collapses the whole chain into one; the client never loads UNET or touches samplers.
 - **GPU sharing (bonus)**: the GPU box can sit behind llama-swap and swap exclusively with LLMs. H3 is only loaded when needed; the rest of the time the cards serve vLLM / LLM. One machine, two jobs.
 
@@ -78,6 +75,20 @@ python server/h3_server.py \
 
 llama-swap template: `examples/llama-swap.yaml`. Load via `/upstream/minimax-h3-ref2va/health`, unload via `POST /api/models/unload`.
 
-## VRAM
+## VRAM & performance (reference: 2× RTX 3080 20GB TP2)
 
-2× RTX 3080 20GB TP2. Short clips (~5 frames, 0.3MP) are fine. A 10-second 0.3MP clip will saturate both cards. Lower duration / megapixels, or go TP4 to spread across more cards.
+- Idle after load: `cuda:0 ≈ 5GB / cuda:1 ≈ 2.2GB` (leftovers on 0, AdaLN on CPU, prefix auto-sized).
+- 0.3MP: ~65s/step. 0.6MP: ~240s/step — the 3.7× jump for 2× pixels is attention `O(n²)`, not the TP layer.
+- A 10-second 0.3MP clip will saturate both cards. Lower duration / megapixels, or go TP4 to spread across more cards.
+- One line per step in the server log: `[h3-server] step 3/20  65.1s  elapsed 195.3s`.
+
+## Next up: sequence parallel (plan.md)
+
+TP is at its efficiency ceiling for this hardware (0.75 × 2 cards, no P2P). The next win is Ulysses-style sequence parallel for attention — see `plan.md` (240s → ~150–170s expected for 0.6MP).
+
+## Docs
+
+- `docs/environment.md` — 兩台機器部署環境快照（GPU 伺服器 192.168.0.160 / Windows 客戶端 192.168.0.10）
+- `docs/efficiency.md` — 雙 3080 TP2 vs 4070TiS 的算力與 step 時間拆帳（0.75 效率為 vLLM 實測）
+- `examples/workflows/h3_remote_ref2va.json` — 正式工作流（含 RemoteDenoiseNode，可直接匯入 ComfyUI）
+- `plan.md` — sequence parallel 實作計劃（Ulysses-style attention）
