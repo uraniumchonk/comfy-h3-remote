@@ -237,6 +237,7 @@ class RemoteDenoiseNode:
             },
             "optional": {
                 "negative": ("CONDITIONING", {}),
+                "lora_stack": ("H3_LORA_STACK",),
                 "lora_name": (_LORA_LIST, {"default": "None"}),
                 "lora_strength": ("FLOAT", {"default": 0.9, "min": -2.0, "max": 2.0, "step": 0.05}),
             },
@@ -248,7 +249,7 @@ class RemoteDenoiseNode:
 
     def denoise(self, latent_image, positive, steps, cfg, sampler_name, scheduler,
                 seed, denoise, shift_video, shift_audio, server_url, negative=None,
-                lora_name="None", lora_strength=0.9):
+                lora_stack=None, lora_name="None", lora_strength=0.9):
         data = {
             "latent_image": latent_image,
             "positive": positive,
@@ -263,7 +264,42 @@ class RemoteDenoiseNode:
             "shift_audio": shift_audio,
             "disable_noise": False,
         }
+        loras = list(lora_stack or [])
         if lora_name and lora_name != "None":
-            data["loras"] = [{"name": lora_name, "strength": float(lora_strength)}]
+            loras.append({"name": lora_name, "strength": float(lora_strength)})
+        if loras:
+            data["loras"] = loras
         result = send_denoise_request(data, server_url)
         return ({"samples": result["samples"]},)
+
+
+class H3LoraStack:
+    """Chain like official LoraLoader: Stack -> Stack -> RemoteDenoise.
+
+    Each node appends one (name, strength) if enabled. Output is a plain
+    list; the denoise node sends it as data['loras'].
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "lora_name": (_LORA_LIST, {"default": "None"}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.05}),
+                "enabled": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "lora_stack": ("H3_LORA_STACK",),
+            },
+        }
+
+    RETURN_TYPES = ("H3_LORA_STACK",)
+    RETURN_NAMES = ("lora_stack",)
+    FUNCTION = "stack"
+    CATEGORY = "MiniMax H3"
+
+    def stack(self, lora_name, strength, enabled=True, lora_stack=None):
+        out = list(lora_stack or [])
+        if enabled and lora_name and lora_name != "None":
+            out.append({"name": lora_name, "strength": float(strength)})
+        return (out,)
