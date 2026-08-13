@@ -182,22 +182,23 @@ def _estimate_seq(data):
 
 
 def _pick_resident_for_seq(seq, devices, n_blocks=50):
-    """Flash/sage attn workspace is linear in seq, not S^2.
+    """Budget from card total. Linear QKV copies + one [S,S] bf16 fallback.
 
-    The old S^2 * 28 * 2 estimate treated eager scores as real (13GB at
-    seq=16k) and forced resident=0. Observed: 0.3MP seq~16k + resident=4
-    fits a 20GB card; 186MB + resident=12 OOM'd. Budget from card total
-    so an already-placed prefix does not shrink the count to zero.
+    Observed: seq~16k + resident=12 fits; seq~24k + resident=12 OOM'd on a
+    1.32GB alloc (~one [S,S]). Old 25000-tier let 24223 through.
     """
     _, total = torch.cuda.mem_get_info(torch.device(devices[0]).index)
-    leftovers = int(4.5 * 1024 ** 3)          # refiner + patch + embed on 0
-    workspace = seq * 28 * 128 * 2 * 10       # ~10 copies of [S, heads, dim]
-    slack = int(2.5 * 1024 ** 3)
+    leftovers = int(4.5 * 1024 ** 3)
+    qkv = seq * 28 * 128 * 2 * 10
+    scores = seq * seq * 2                    # one [S,S] bf16 if flash falls back
+    slack = int(3.0 * 1024 ** 3)
     per_layer = 220 * 1024 ** 2
-    cap = max(0, int((total - leftovers - workspace - slack) / per_layer))
-    if seq >= 40000:
+    cap = max(0, int((total - leftovers - qkv - scores - slack) / per_layer))
+    if seq >= 28000:
+        cap = min(cap, 0)
+    elif seq >= 20000:
         cap = min(cap, 4)
-    elif seq >= 25000:
+    elif seq >= 18000:
         cap = min(cap, 8)
     return max(0, min(12, cap, n_blocks))
 
@@ -250,7 +251,9 @@ def run_denoise(data):
             resident = _pick_resident_for_seq(seq, ("cuda:0", "cuda:1"))
             set_resident(MODEL.model.diffusion_model, resident)
             print(
-                f"[h3-server] seq~{seq} workspace={seq * 28 * 128 * 2 * 10 / 1e9:.1f}G "
+                f"[h3-server] seq~{seq} "
+                f"qkv={seq * 28 * 128 * 2 * 10 / 1e9:.1f}G "
+                f"scores={seq * seq * 2 / 1e9:.1f}G "
                 f"resident={resident}",
                 flush=True,
             )
