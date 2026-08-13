@@ -113,6 +113,23 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
 
     th = threading.Thread(target=_post, daemon=True)
     th.start()
+
+    steps = int(data.get("steps") or 20)
+    pbar = None
+    bar = None
+    try:
+        from comfy.utils import ProgressBar
+        pbar = ProgressBar(steps)
+        pbar.update_absolute(0, steps)
+    except Exception:
+        pbar = None
+    try:
+        from tqdm import tqdm
+        bar = tqdm(total=steps, desc="H3", unit="it", dynamic_ncols=True)
+    except Exception:
+        bar = None
+
+    last = -1
     while th.is_alive():
         if mm.processing_interrupted():
             try:
@@ -122,8 +139,36 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
                 )
             except Exception:
                 pass
+            if bar is not None:
+                bar.close()
             mm.throw_exception_if_processing_interrupted()
-        th.join(0.2)
+        try:
+            with urllib.request.urlopen(f"{base}/progress", timeout=2) as resp:
+                info = json.loads(resp.read().decode())
+            i = int(info.get("step") or 0)
+            total = int(info.get("total") or steps)
+            if i != last and i >= 0:
+                if pbar is not None:
+                    pbar.update_absolute(i, total)
+                if bar is not None:
+                    bar.total = total
+                    bar.n = i
+                    step_s = info.get("step_s") or 0
+                    if step_s:
+                        bar.set_postfix_str(f"{float(step_s):.1f}s/it")
+                    bar.refresh()
+                last = i
+        except Exception:
+            pass
+        th.join(0.5)
+
+    if bar is not None:
+        if box["err"] is None:
+            bar.n = bar.total
+            bar.refresh()
+        bar.close()
+    if pbar is not None and box["err"] is None:
+        pbar.update_absolute(pbar.total, pbar.total)
 
     if box["err"] is not None:
         raise box["err"]
