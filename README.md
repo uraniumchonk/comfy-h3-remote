@@ -5,29 +5,29 @@
 
 # ComfyUI Remote Denoise (MiniMax H3)
 
-## 目標
+## Goal
 
-讓 ComfyUI 能跑 MiniMax H3 Ref2VA 的 denoise，並用上多卡 tensor parallel（TP2 / TP4）加速。現在玩本地 LLM 的人都會有一台多卡 GPU 伺服器，這台機器除了跑 LLM，也能拿來跑 ComfyUI 生成影片這種計算量超重的模型，享受多卡加速。客戶端只跑 CLIP / VAE / Ref2VA 編碼，DiT 在遠端 GPU box 上切卡跑，denoise 完的 latent 送回客戶端解碼。
+Run MiniMax H3 Ref2VA denoise inside ComfyUI with multi-GPU tensor parallelism (TP2 / TP4). Anyone running local LLMs already owns a multi-GPU server — that same box can also run compute-heavy ComfyUI video generation and benefit from multi-GPU acceleration. The client only runs CLIP / VAE / Ref2VA encoding; the DiT runs sharded across GPUs on a remote box, and the denoised latent is sent back to the client for decoding.
 
-## 解決的痛點
+## Problems solved
 
-- **ComfyUI 原生沒有多卡 TP**：單卡其實跑得了 MiniMax H3 Ref2VA，但手上有 2 / 4 卡伺服器的人，卡閒著也是閒著——影片生成計算量超重，正是多卡加速最有價值的地方。ComfyUI 的 DiT 預設只能單卡跑，多卡 TP 這個功能原生根本沒有。`server/h3_tp.py` 自寫 Megatron-style TP：qkv / fc1 走 column-parallel（QKV / SwiGLU 用 index map，不是對半切），out / fc2 走 row-parallel + all-reduce，2 卡或 4 卡都能切，50 個 DiT block 均勻散到各卡。
-- **不用 vLLM-omni 跑超大完整 BF16**：別條路線是整包 BF16 模型丟 vLLM-omni，需要極多張大卡。這裡用 INT8+ConvRot 量化 + TP，2× RTX 3080 20GB 就能跑短片。
-- **接線簡化（附帶）**：官方模板要接 `UNETLoader → BasicGuider`、`RandomNoise + KSamplerSelect + BasicScheduler → SamplerCustomAdvanced` 一串節點，客戶端還得載 UNET。這個節點把整段收成一個，客戶端不載 UNET、不碰採樣器。
-- **GPU 共享（附帶）**：GPU box 可掛 llama-swap，跟 LLM 互斥換卡。H3 要跑時才載入，平時卡留給 vLLM / LLM，一台機器兩種用途。
+- **ComfyUI has no multi-GPU TP out of the box**: MiniMax H3 Ref2VA actually fits on a single GPU, but if you own a 2 / 4-GPU server, those idle cards are wasted potential — video generation is extremely compute-heavy, exactly where multi-GPU acceleration pays off the most. ComfyUI DiTs only run on one GPU by default; multi-GPU TP simply doesn't exist natively. `server/h3_tp.py` implements Megatron-style TP from scratch: qkv / fc1 are column-parallel (QKV / SwiGLU use index maps, not naive half-splits), out / fc2 are row-parallel with all-reduce, and it scales to 2 or 4 cards with all 50 DiT blocks evenly spread across them.
+- **No vLLM-omni, no giant full BF16 models**: the alternative route is dumping the full BF16 model into vLLM-omni, which needs a huge number of big cards. This project uses INT8+ConvRot quantization + TP instead, so 2× RTX 3080 20GB is enough for short clips.
+- **Simplified wiring (bonus)**: the official template requires a chain of nodes — `UNETLoader → BasicGuider`, `RandomNoise + KSamplerSelect + BasicScheduler → SamplerCustomAdvanced` — and the client has to load UNET. This node collapses the whole chain into one; the client never loads UNET or touches samplers.
+- **GPU sharing (bonus)**: the GPU box can sit behind llama-swap and swap exclusively with LLMs. H3 is only loaded when needed; the rest of the time the cards serve vLLM / LLM. One machine, two jobs.
 
-## 客戶端
+## Client
 
 ```text
 cd ComfyUI/custom_nodes
 git clone https://github.com/uraniumchonk/comfy-h3-remote ComfyUI-RemoteDenoiseH3
 ```
 
-重啟 ComfyUI。選單：`MiniMax H3` → `Remote Denoise Node (H3)`。
+Restart ComfyUI. Menu: `MiniMax H3` → `Remote Denoise Node (H3)`.
 
-## 接線
+## Wiring
 
-官方模板要接一串採樣器：
+The official template requires a chain of samplers:
 
 ```text
 UNETLoader → BasicGuider
@@ -35,7 +35,7 @@ RandomNoise + KSamplerSelect + BasicScheduler → SamplerCustomAdvanced
 MiniMaxH3ReferenceToVideo ──latent/cond──▶ SamplerCustomAdvanced ──▶ VAE Decode
 ```
 
-這個節點把上面整段收進去。改成：
+This node absorbs that whole chain. Replace it with:
 
 ```text
 MiniMaxH3ReferenceToVideo
@@ -46,26 +46,26 @@ MiniMaxH3ReferenceToVideo
                           VAEDecode + VAEDecodeAudio → Video Combine
 ```
 
-客戶端不要載 UNET，不要接 KSampler / SamplerCustomAdvanced / Guider / Scheduler / RandomNoise。
+The client must not load UNET, and must not wire up KSampler / SamplerCustomAdvanced / Guider / Scheduler / RandomNoise.
 
-| 欄位 | 意思 |
+| Field | Meaning |
 |---|---|
-| steps / cfg / sampler / scheduler / seed | 原本在 KSampler 上的 |
-| denoise | `0–1`。**不是 12** |
-| shift_video | 預設 `12` |
-| shift_audio | 預設 `3` |
-| server_url | 見下 |
+| steps / cfg / sampler / scheduler / seed | Same as on KSampler |
+| denoise | `0–1`. **NOT 12** |
+| shift_video | Default `12` |
+| shift_audio | Default `3` |
+| server_url | See below |
 
-seed 後面有一格 `fixed` / `randomize`（Comfy 自動加）。存工作流別漏，否則 12 會擠進 denoise。
+There is a `fixed` / `randomize` toggle after seed (added automatically by Comfy). Don't leave it out when saving the workflow, or 12 will leak into denoise.
 
-`server_url`：
+`server_url`:
 
-- llama-swap：`http://192.168.0.160:8090/upstream/minimax-h3-ref2va`
-- 直連：`http://<gpu-box>:8299`
+- llama-swap: `http://192.168.0.160:8090/upstream/minimax-h3-ref2va`
+- Direct: `http://<gpu-box>:8299`
 
-## 服務端
+## Server
 
-需要 ComfyUI 0.30+（MiniMax H3 + comfy_kitchen）跟 INT8+ConvRot 權重。權重不在這個 repo。
+Requires ComfyUI 0.30+ (MiniMax H3 + comfy_kitchen) and INT8+ConvRot weights. The weights are not in this repo.
 
 ```bash
 export COMFYUI_ROOT=/path/to/ComfyUI
@@ -74,10 +74,10 @@ python server/h3_server.py \
   --tp --host 0.0.0.0 --port 8299
 ```
 
-`--tp`：tensor parallel。目前走 TP2（`h3_server.py` 呼叫 `apply_tp` 用預設 2 卡）；`h3_tp.py` 的 index map 切法本身支援 2 / 4 卡整除（heads 56、FFN 14336、inner 7168 都除得盡 4），要上 TP4 把 `apply_tp` 的 devices 參數接成 4 卡即可。QKV / SwiGLU 用 index map 切，不是對半切；out / fc2 用 row-parallel + all-reduce。
+`--tp`: tensor parallelism. Currently runs TP2 (`h3_server.py` calls `apply_tp` with the default 2 devices); the index-map sharding in `h3_tp.py` itself supports 2 / 4 cards (heads 56, FFN 14336, inner 7168 all divide evenly by 4) — to go TP4, just wire `apply_tp`'s devices parameter to 4 cards. QKV / SwiGLU are cut with index maps, not naive half-splits; out / fc2 use row-parallel + all-reduce.
 
-llama-swap 範本：`examples/llama-swap.yaml`。載入 `/upstream/minimax-h3-ref2va/health`，卸載 `POST /api/models/unload`。
+llama-swap template: `examples/llama-swap.yaml`. Load via `/upstream/minimax-h3-ref2va/health`, unload via `POST /api/models/unload`.
 
 ## VRAM
 
-2× RTX 3080 20GB TP2。短片（約 5 frame、0.3MP）OK。10 秒 0.3MP 會把兩張卡灌滿。先降 duration / megapixels，或上 TP4 攤更多卡。
+2× RTX 3080 20GB TP2. Short clips (~5 frames, 0.3MP) are fine. A 10-second 0.3MP clip will saturate both cards. Lower duration / megapixels, or go TP4 to spread across more cards.
