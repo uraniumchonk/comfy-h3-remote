@@ -182,13 +182,23 @@ def _estimate_seq(data):
 
 
 def _pick_resident_for_seq(seq, devices, n_blocks=50):
-    """Attention workspace ~ O(seq^2) per card (28 local heads, bf16 scores).
-    Keep 10GB headroom for embed/refiner/final + CFG slack."""
-    free0, _ = torch.cuda.mem_get_info(torch.device(devices[0]).index)
-    scores = (seq ** 2) * 28 * 2          # bf16 [S,S] per local head
-    headroom = 6 * 1024 ** 3              # leftovers + activations + slack
+    """Flash/sage attn workspace is linear in seq, not S^2.
+
+    The old S^2 * 28 * 2 estimate treated eager scores as real (13GB at
+    seq=16k) and forced resident=0. Observed: 0.3MP seq~16k + resident=4
+    fits a 20GB card; 186MB + resident=12 OOM'd. Budget from card total
+    so an already-placed prefix does not shrink the count to zero.
+    """
+    _, total = torch.cuda.mem_get_info(torch.device(devices[0]).index)
+    leftovers = int(4.5 * 1024 ** 3)          # refiner + patch + embed on 0
+    workspace = seq * 28 * 128 * 2 * 10       # ~10 copies of [S, heads, dim]
+    slack = int(2.5 * 1024 ** 3)
     per_layer = 220 * 1024 ** 2
-    cap = max(0, int((free0 - scores - headroom) / per_layer))
+    cap = max(0, int((total - leftovers - workspace - slack) / per_layer))
+    if seq >= 40000:
+        cap = min(cap, 4)
+    elif seq >= 25000:
+        cap = min(cap, 8)
     return max(0, min(12, cap, n_blocks))
 
 
@@ -220,7 +230,11 @@ def run_denoise(data):
             seq = _estimate_seq(data)
             resident = _pick_resident_for_seq(seq, ("cuda:0", "cuda:1"))
             set_resident(MODEL.model.diffusion_model, resident)
-            print(f"[h3-server] seq~{seq} resident={resident}", flush=True)
+            print(
+                f"[h3-server] seq~{seq} workspace={seq * 28 * 128 * 2 * 10 / 1e9:.1f}G "
+                f"resident={resident}",
+                flush=True,
+            )
         except Exception as e:
             print(f"[h3-server] dynamic resident skipped: {e}", flush=True)
 
