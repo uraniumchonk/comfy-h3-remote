@@ -47,7 +47,8 @@ The client must not load UNET, and must not wire up KSampler / SamplerCustomAdva
 
 | Field | Meaning |
 |---|---|
-| steps / cfg / sampler / scheduler / seed | Same as on KSampler |
+| steps / sampler / scheduler / seed | Same as on KSampler |
+| cfg | **Always 1.0 for H3.** H3 is flow-matching; the official template uses BasicGuider (cfg=1.0, no CFG). Any cfg > 1 amplifies positive/negative error and the output comes out as snow/black. |
 | denoise | `0–1`. **NOT 12** |
 | shift_video | Default `12` |
 | shift_audio | Default `3` |
