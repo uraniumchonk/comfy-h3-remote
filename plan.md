@@ -78,10 +78,10 @@ residual 全程只在各自卡上，不再整條廣播
 3. 移除 attn/mlp forward 開頭的 `_nccl_broadcast(x, devices)`
 - 驗證：50-block forward finite + amax 對單卡 < 1e-6；0.3MP step 時間對照（應該比現在 65s 略快或持平，但不該變慢）
 
-### M3：峰值優化 + resident 重算（1 天）
-1. attention 的 QK^T 用 tile / chunk 迴圈（`for chunk in seq.chunk(k)`），峰值從 [S,S] 降到 [S/k, S]
-2. `_pick_resident` 的 reserve 因為 activation 峰值下降可以下修 → resident 拉高 → offload 減少
-3. 0.6MP 實測：nvidia-smi 兩卡 util 同時高、power 穩定
+### M3：峰值優化 + resident 重算（提前做了一半）
+1. ~~attention 的 QK^T 用 tile~~ **已上**：`seq>=20000` 時 Q 切 2 段，峰值 `[S/2,S]`（1.32G→0.66G）。Ulysses all-to-all 不會縮小這塊。
+2. `_pick_resident`：`seq>=20000` 先 resident=0；tile 穩定後再把 24k 拉回 4～8
+3. 0.6MP 實測
 - 驗證：0.6MP step 時間落在 150–180s；兩卡 VRAM 接近對半
 
 ### M4：打包 + 文件

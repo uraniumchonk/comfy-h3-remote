@@ -406,13 +406,28 @@ def _replace_attn(attn, devices, streams=None, shard_dev=None):
                 k = torch.nn.functional.rms_norm(
                     k.view(seq, local_heads, head_dim), (head_dim,), kw, orig_k_norm.eps)
             v = v.clone()
-            q = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
-            k = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
-            v = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
-            return optimized_attention(
-                q, k, v, local_heads, mask=None, skip_reshape=True,
-                transformer_options=transformer_options,
-            ).squeeze(0)
+            # Plan M3 pulled forward: seq>=20k a 1.32GB [S,S] bf16 does not
+            # fit next to leftovers on cuda:0. Ulysses all-to-all (plan M1)
+            # still builds [S,S] per card. Chunk Q so peak is [S/tiles, S].
+            tiles = 2 if seq >= 20000 else 1
+            k_c = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
+            v_c = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+            if tiles == 1:
+                q_c = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
+                return optimized_attention(
+                    q_c, k_c, v_c, local_heads, mask=None, skip_reshape=True,
+                    transformer_options=transformer_options,
+                ).squeeze(0)
+            step = (seq + tiles - 1) // tiles
+            chunks = []
+            for s0 in range(0, seq, step):
+                q_c = AttentionTensorContainer(
+                    q[s0:s0 + step].transpose(0, 1).unsqueeze(0))
+                chunks.append(optimized_attention(
+                    q_c, k_c, v_c, local_heads, mask=None, skip_reshape=True,
+                    transformer_options=transformer_options,
+                ).squeeze(0))
+            return torch.cat(chunks, dim=0)
 
         local_outs = _run_ranks(devices, _one)
         return reduce_row_linear(local_outs, out_shards, out_device, streams)
