@@ -197,12 +197,10 @@ def _pick_resident_for_seq(seq, devices, n_blocks=50):
     slack = int(3.0 * 1024 ** 3)
     per_layer = 220 * 1024 ** 2
     cap = max(0, int((total - leftovers - qkv - scores - slack) / per_layer))
-    if seq >= 28000:
+    if seq >= 20000:
         cap = min(cap, 0)
-    elif seq >= 20000:
-        cap = min(cap, 4)
     elif seq >= 18000:
-        cap = min(cap, 8)
+        cap = min(cap, 4)
     return max(0, min(12, cap, n_blocks))
 
 
