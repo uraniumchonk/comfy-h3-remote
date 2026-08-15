@@ -739,8 +739,8 @@ class RemoteEncodeSubmit:
         return (latent if latent is not None else trigger,)
 
 
-def _mailbox_wait(load_fn, kind, timeout=7200):
-    """ready 就回傳；有 running 就堵住等；真的沒上一輪才回 None。"""
+def _mailbox_wait(load_fn, kind, timeout=7200, wait_empty=False):
+    """ready 回傳；running 就等。wait_empty 時信箱空也繼續等，不立刻報錯。"""
     import comfy.model_management as mm
 
     t0 = time.time()
@@ -755,19 +755,20 @@ def _mailbox_wait(load_fn, kind, timeout=7200):
             return ready
         if failed is not None and not running:
             raise RuntimeError(f"{kind} mailbox error: {failed.get('error')}")
-        if not running:
+        if not running and not wait_empty:
             return None
         if time.time() - t0 > timeout:
             raise RuntimeError(f"{kind} mailbox wait timeout ({timeout}s)")
         if mm.processing_interrupted():
             mm.throw_exception_if_processing_interrupted()
-        print(f"[h3-client] {kind} mailbox running, waiting {time.time()-t0:.0f}s",
+        why = "running" if running else "empty"
+        print(f"[h3-client] {kind} mailbox {why}, waiting {time.time()-t0:.0f}s",
               flush=True)
         time.sleep(0.4)
 
 
 class RemoteEncodeCollect:
-    """跨圖信箱：拿上一輪 encode。還在跑就等；信箱真的空才報錯。"""
+    """跨圖信箱：拿上一輪 encode。還在跑就等；信箱空立刻報錯。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -783,11 +784,9 @@ class RemoteEncodeCollect:
         return float("NaN")
 
     def collect(self):
-        job = _mailbox_wait(_encode_box_load, "encode")
+        job = _mailbox_wait(_encode_box_load, "encode", wait_empty=False)
         if job is None:
-            raise RuntimeError(
-                "encode mailbox 沒有上一輪。先跑 h3_async_prefill.json 再 Queue 這張。"
-            )
+            raise RuntimeError("encode mailbox empty")
         path = job.get("result_path")
         if not path or not os.path.isfile(path):
             _encode_box_update(job["id"], status="error", error="result missing")
