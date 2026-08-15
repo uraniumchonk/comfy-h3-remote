@@ -115,6 +115,7 @@ llama-swap 範本：`examples/llama-swap.yaml`（`h3-async` 組：encode 卡 1 +
 ## 硬體參考（2×3080 20GB）
 
 - 場景 A DiT TP2：閒置約 5GB + 2.2GB。0.3MP ≈ 38–65s/step，0.6MP ≈ 240s/step（attention O(n²)）。
+- 場景 B 實測（本地 8 步 LoRA denoise，遠端 CLIP+VAE）：**0.4MP / 10 秒 / 8 step — denoise 91 秒，整張 Queue 95.90 秒**。多出來的約 4 秒是 ffmpeg 轉檔。Collect / Submit 等節點等於瞬間。denoise 已完全非同步。
 - 場景 B decode 0.6MP 124 幀：單卡 ≈ 44s；243 幀 672×448 fp32 回條約 880MB。
 - Encode：VAE 先、卸回 RAM、再 CLIP（預留 12GB 給 vision / dequant）。
 - 無 NVLink、BAR1=256MiB：NCCL 只能 SHM/direct。

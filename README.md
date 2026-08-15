@@ -115,6 +115,7 @@ llama-swap snippet: `examples/llama-swap.yaml` (`h3-async`: encode on GPU 1, dec
 ## Hardware notes (2×3080 20GB)
 
 - Scene A DiT TP2: idle ~5GB + 2.2GB. 0.3MP ≈ 38–65s/step, 0.6MP ≈ 240s/step (attention is O(n²)).
+- Scene B, measured (local 8-step LoRA denoise, remote CLIP+VAE): **0.4MP / 10s / 8 steps — denoise 91s, full queue 95.90s**. The extra ~4s is ffmpeg mux. Collect / Submit / other nodes are effectively free. Denoise is fully async.
 - Scene B decode 0.6MP 124 frames: ~44s on 1 GPU; 243×672×448 fp32 pack ≈ 880MB.
 - Encode: VAE first, offload to RAM, then CLIP (keep ~12GB free for vision / dequant).
 - No NVLink, BAR1=256MiB: NCCL is SHM/direct only.
