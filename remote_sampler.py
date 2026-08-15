@@ -322,7 +322,7 @@ class RemoteDecodeNode:
     RETURN_TYPES = ("IMAGE", "AUDIO")
     RETURN_NAMES = ("images", "audio")
     FUNCTION = "decode"
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
 
     async def decode(self, samples, server_url):
         result = await send_decode_request_async({"samples": samples}, server_url)
@@ -330,11 +330,7 @@ class RemoteDecodeNode:
 
 
 class RemoteDecodeSubmit:
-    """DVB For-Each 信箱：denoise 完立刻丟 160，latent 原樣透傳。
-
-    寫 output/h3_decode_mailbox.json，背景下載畫面到 h3_decode_jobs/{id}.pt。
-    同一輪不要接 Collect 等這一單；Collect 只收上一輪已經 ready 的。
-    """
+    """DVB 信箱：denoise 完立刻丟 160。沒有輸出，避免跟這一輪 latent 搞混。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -348,10 +344,10 @@ class RemoteDecodeSubmit:
             },
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("samples",)
+    RETURN_TYPES = ()
     FUNCTION = "submit"
-    CATEGORY = "MiniMax H3"
+    OUTPUT_NODE = True
+    CATEGORY = "Remote Pipe"
 
     def submit(self, samples, server_url):
         job_id = uuid.uuid4().hex
@@ -385,34 +381,30 @@ class RemoteDecodeSubmit:
 
         threading.Thread(target=_work, daemon=True).start()
         print(f"[h3-client] mailbox submit {job_id}", flush=True)
-        return (samples,)
+        return {}
 
 
 class RemoteDecodeCollect:
-    """DVB For-Each Done：denoise 完串在 Submit 後面，只拿「已經 ready 的舊 job」。
-
-    不會等這一輪剛 Submit 的 running job，所以下一輪 denoise 期間 160 在解上一單，
-    這一輪 Collect 把上一單畫面丟給 VHS。第一輪信箱空：輸出 1 幀黑圖，VHS 可忽略。
-    """
+    """只拿上一輪已經 ready 的畫面。stamp 只決定執行順序，不是這一輪 latent。"""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "samples": ("LATENT", {}),
+                "stamp": ("*", {}),
             },
         }
 
-    RETURN_TYPES = ("LATENT", "IMAGE")
-    RETURN_NAMES = ("samples", "images")
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
     FUNCTION = "collect"
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
 
     @classmethod
     def IS_CHANGED(cls, *values, **kwargs):
         return float("NaN")
 
-    def collect(self, samples):
+    def collect(self, stamp):
         with _MAILBOX_LOCK:
             data = _mailbox_load()
             job = None
@@ -423,8 +415,7 @@ class RemoteDecodeCollect:
 
         if job is None:
             print("[h3-client] mailbox empty, skip collect", flush=True)
-            dummy = torch.zeros(1, 8, 8, 3)
-            return (samples, dummy)
+            return (torch.zeros(1, 8, 8, 3),)
 
         path = job.get("frames_path")
         if not path or not os.path.isfile(path):
@@ -438,7 +429,7 @@ class RemoteDecodeCollect:
         except OSError:
             pass
         print(f"[h3-client] mailbox collect {job['id']} {list(frames.shape)}", flush=True)
-        return (samples, frames)
+        return (frames,)
 
 
 class RemoteDecodeGet(RemoteDecodeCollect):
@@ -580,7 +571,7 @@ class RemoteEncodeNode:
     RETURN_TYPES = ("CONDITIONING", "LATENT")
     RETURN_NAMES = ("positive", "latent")
     FUNCTION = "encode"
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
 
     async def encode(self, prompt, width, height, length, ref_image_size, server_url,
                      ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None):
@@ -614,7 +605,7 @@ class RemoteEncodeSubmit:
     RETURN_NAMES = ("queued",)
     FUNCTION = "submit"
     OUTPUT_NODE = True
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
 
     def submit(self, prompt, width, height, length, ref_image_size, server_url,
                ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None,
@@ -664,7 +655,7 @@ class RemoteEncodeCollect:
     RETURN_TYPES = ("CONDITIONING", "LATENT")
     RETURN_NAMES = ("positive", "latent")
     FUNCTION = "collect"
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
 
     @classmethod
     def IS_CHANGED(cls, *values, **kwargs):
@@ -720,7 +711,7 @@ class RemoteDenoiseSampler:
     
     RETURN_TYPES = ("LATENT", "LATENT")
     FUNCTION = "sample"
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
     
     def sample(self, noise, guider, sampler, sigmas, latent_image, server_url):
         # Extract model from guider
@@ -811,7 +802,7 @@ class RemoteDenoiseNode:
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "denoise"
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
 
     def denoise(self, positive, steps, cfg, sampler_name, scheduler,
                 seed, denoise, shift_video, shift_audio, server_url,
@@ -865,7 +856,7 @@ class H3LoraStack:
     RETURN_TYPES = ("H3_LORA_STACK",)
     RETURN_NAMES = ("lora_stack",)
     FUNCTION = "stack"
-    CATEGORY = "MiniMax H3"
+    CATEGORY = "Remote Pipe"
 
     def stack(self, lora_name, strength, enabled=True, lora_stack=None):
         out = list(lora_stack or [])
