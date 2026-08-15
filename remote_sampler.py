@@ -355,12 +355,20 @@ async def send_decode_request_async(data, server_url=DEFAULT_DECODE_SERVER, time
     return await fut
 
 
+def _audio_or_false(audio):
+    if not isinstance(audio, dict):
+        return False
+    w = audio.get("waveform")
+    if w is None or not hasattr(w, "numel") or int(w.numel()) <= 2:
+        return False
+    return audio
+
+
 def _unpack_decode(result):
     frames = result.get("frames")
-    audio = result.get("audio")
     if frames is None:
         raise RuntimeError("decode server returned no frames")
-    return (frames, audio)
+    return (frames, _audio_or_false(result.get("audio")))
 
 
 class RemoteDecodeNode:
@@ -480,10 +488,9 @@ class RemoteDecodeCollect:
             data = _mailbox_load()
             job = next((j for j in data["jobs"] if j.get("status") == "ready"), None)
 
-        silent = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 32000}
         if job is None:
             print("[h3-client] decode mailbox empty, skip collect", flush=True)
-            return (torch.zeros(1, 8, 8, 3), silent)
+            return (torch.zeros(1, 8, 8, 3), False)
 
         path = job.get("frames_path")
         if not path or not os.path.isfile(path):
@@ -504,10 +511,10 @@ class RemoteDecodeCollect:
             result = _deserialize(packed)
             frames, audio = _unpack_decode(result)
         else:
-            frames, audio = packed, silent
-        if audio is None:
-            audio = silent
-        print(f"[h3-client] mailbox collect {job['id']} {list(frames.shape)}", flush=True)
+            frames, audio = packed, False
+        audio = _audio_or_false(audio)
+        print(f"[h3-client] mailbox collect {job['id']} {list(frames.shape)} "
+              f"audio={'ok' if audio is not False else 'false'}", flush=True)
         return (frames, audio)
 
 
