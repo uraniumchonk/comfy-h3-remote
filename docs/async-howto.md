@@ -1,8 +1,8 @@
-# Async serial / 跨圖非同步
+# Scenario B — local denoise, remote CLIP + VAE
 
-Two graphs. Prefill once, then loop the main workflow.
+Local GPU keeps sampling. Remote box encodes CLIP and decodes video/audio. Two graphs.
 
-兩張圖。Prefill 只跑一次，之後反覆 Queue 主工作流。
+場景 B：本地狂 denoise，遠端狂跑 CLIP 與 VAE。兩張圖。
 
 ## 1. Prefill — `h3_async_prefill.json`
 
