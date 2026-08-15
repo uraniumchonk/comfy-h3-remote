@@ -90,6 +90,7 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
     import threading
     import comfy.model_management as mm
 
+    ensure_upstream(server_url)
     base = server_url.rstrip("/")
     health = f"{base}/health"
     print(f"[h3-client] waking {health}", flush=True)
@@ -186,9 +187,72 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
 # ComfyUI Nodes
 # ---------------------------------------------------------------------------
 
-# video decode 服務（160 卡 0，llama-swap 管理）。audio decode 預留：目前留在 10 號機本機。
-# llama-swap /upstream/<id>：第一次請求會卸載當前模型、拉起 decode 服務
+# llama-swap /upstream/<id>：第一次請求會拉起服務。ttl=0 時 DiT 不會自己卸，
+# ensure_upstream 在目標沒起來時先 unload 再等到 /health。
 DEFAULT_DECODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-vae-decode"
+
+_ASYNC_SWAP = (
+    "minimax-h3-vae-decode-1",
+    "minimax-h3-clip-encode",
+    "minimax-h3-vae-decode",
+)
+
+
+def _upstream_id(server_url):
+    u = server_url.rstrip("/")
+    if "/upstream/" not in u:
+        return None, None
+    base, rest = u.split("/upstream/", 1)
+    return base, rest.split("/")[0]
+
+
+def ensure_upstream(server_url, timeout=300):
+    """目標 /health 沒好：必要時卸 DiT，然後同步等到服務起來。"""
+    import comfy.model_management as mm
+
+    health = server_url.rstrip("/") + "/health"
+
+    def ok(t=4):
+        try:
+            with urllib.request.urlopen(health, timeout=t) as r:
+                return 200 <= r.status < 300
+        except Exception:
+            return False
+
+    if ok():
+        return
+
+    base, target = _upstream_id(server_url)
+    if base:
+        names = []
+        try:
+            with urllib.request.urlopen(base + "/running", timeout=3) as r:
+                data = json.loads(r.read().decode())
+            names = [m.get("model", "") for m in data.get("running", [])]
+        except Exception:
+            names = []
+        hold = [n for n in names if n in _ASYNC_SWAP and n != target]
+        # DiT 跟 async 服務互斥：拉 DiT 一定先卸。拉 decode/encode 時若同伴已在就不要卸。
+        must_unload = (target not in _ASYNC_SWAP) or (not hold)
+        if must_unload:
+            try:
+                req = urllib.request.Request(
+                    base + "/api/models/unload", data=b"", method="POST")
+                urllib.request.urlopen(req, timeout=30).read()
+                print(f"[h3-client] swap unload, waiting {target}", flush=True)
+            except Exception as e:
+                print(f"[h3-client] swap unload: {e}", flush=True)
+
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        if ok(8):
+            print(f"[h3-client] upstream ready {target or health} "
+                  f"{time.time()-t0:.1f}s", flush=True)
+            return
+        time.sleep(1)
+    raise RuntimeError(f"upstream not ready: {health}")
 
 _MAILBOX_LOCK = threading.Lock()
 
@@ -239,6 +303,7 @@ def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
     import threading
     import comfy.model_management as mm
 
+    ensure_upstream(server_url)
     base = server_url.rstrip("/")
     payload = dump_bytes(data)
     req = urllib.request.Request(
@@ -353,6 +418,7 @@ class RemoteDecodeSubmit:
         return float("NaN")
 
     def submit(self, samples, server_url):
+        ensure_upstream(server_url)
         job_id = uuid.uuid4().hex
         _, jobs_dir = _mailbox_paths()
         frames_path = os.path.join(jobs_dir, job_id + ".pt")
@@ -499,6 +565,7 @@ def _encode_box_update(job_id, **fields):
 def send_encode_request(data, server_url=DEFAULT_ENCODE_SERVER, timeout=7200):
     import comfy.model_management as mm
 
+    ensure_upstream(server_url)
     base = server_url.rstrip("/")
     payload = dump_bytes(data)
     req = urllib.request.Request(
@@ -623,6 +690,7 @@ class RemoteEncodeSubmit:
     def submit(self, prompt, width, height, length, ref_image_size, server_url,
                ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None,
                trigger=None):
+        ensure_upstream(server_url)
         job_id = uuid.uuid4().hex
         _, jobs_dir = _encode_mailbox_paths()
         payload_path = os.path.join(jobs_dir, job_id + ".pt")
