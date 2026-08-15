@@ -605,15 +605,20 @@ class RemoteEncodeSubmit:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return RemoteEncodeNode.INPUT_TYPES()
+        types = RemoteEncodeNode.INPUT_TYPES()
+        types.setdefault("optional", {})
+        types["optional"]["trigger"] = ("LATENT",)
+        return types
 
-    RETURN_TYPES = ()
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("queued",)
     FUNCTION = "submit"
     OUTPUT_NODE = True
     CATEGORY = "MiniMax H3"
 
     def submit(self, prompt, width, height, length, ref_image_size, server_url,
-               ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None):
+               ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None,
+               trigger=None):
         job_id = uuid.uuid4().hex
         _, jobs_dir = _encode_mailbox_paths()
         payload_path = os.path.join(jobs_dir, job_id + ".pt")
@@ -646,7 +651,7 @@ class RemoteEncodeSubmit:
 
         threading.Thread(target=_work, daemon=True).start()
         print(f"[h3-client] encode mailbox submit {job_id}", flush=True)
-        return ()
+        return (1,)
 
 
 class RemoteEncodeCollect:
@@ -674,7 +679,9 @@ class RemoteEncodeCollect:
                     job = j
                     break
         if job is None:
-            raise RuntimeError("encode mailbox empty — 先跑一輪 RemoteEncodeSubmit")
+            raise RuntimeError(
+                "encode mailbox empty。第一輪正常：EncodeSubmit 已送出，再 Queue 一次即可。"
+            )
         path = job.get("result_path")
         if not path or not os.path.isfile(path):
             _encode_box_update(job["id"], status="error", error="result missing")
