@@ -1,15 +1,17 @@
-# Remote Pipe（MiniMax H3）
+# Remote Pipe (MiniMax H3)
 
-ComfyUI 節點：把 MiniMax H3 的重活丟到 GPU 伺服器。兩個互不綁死的場景。
+[繁體中文](README.zh-TW.md)
 
-| | 場景 A | 場景 B |
+ComfyUI nodes that offload MiniMax H3 heavy work to a GPU box. Two independent scenes.
+
+| | Scene A | Scene B |
 |---|---|---|
-| 誰 denoise | 遠端 DiT（TP2） | **本地** Sampler / UNET |
-| 遠端跑什麼 | 只有 denoise | **CLIP encode + AV VAE decode** |
-| 圖怎麼跑 | 一張等完 | 跨圖 Queue，本地狂採樣、遠端狂編解 |
-| 工作流 | `h3_remote_ref2va.json` | `h3_async_prefill.json` + `h3_ref2va_async_pub.json` |
+| Who denoises | Remote DiT (TP2) | **Local** Sampler / UNET |
+| Remote runs | Denoise only | **CLIP encode + AV VAE decode** |
+| How you queue | One graph, wait | Cross-queue: sample locally, encode/decode remotely |
+| Workflows | `h3_remote_ref2va.json` | `h3_async_prefill.json` + `h3_ref2va_async_pub.json` |
 
-選單分類：`Remote Pipe`。
+Menu category: `Remote Pipe`.
 
 ```text
 cd ComfyUI/custom_nodes
@@ -18,9 +20,9 @@ git clone https://github.com/uraniumchonk/comfy-h3-remote RemotePipe
 
 ---
 
-## 場景 A — denoise 丟遠端
+## Scene A — remote denoise
 
-客戶端跑官方 Ref2VA（CLIP + 空 latent）和 VAE decode。UNET / Sampler 整串拿掉，換成一顆 `Pipe Denoise`。
+The client keeps official Ref2VA (CLIP + empty latent) and VAE decode. Drop the UNET / Sampler chain for one `Pipe Denoise` node.
 
 ```text
 MiniMaxH3ReferenceToVideo
@@ -31,19 +33,19 @@ MiniMaxH3ReferenceToVideo
               VAEDecode + VAEDecodeAudio → VHS
 ```
 
-或遠端順便解：`Pipe Denoise` → `Pipe Decode (sync)` → VHS。
+Or decode remotely too: `Pipe Denoise` → `Pipe Decode (sync)` → VHS.
 
-| 欄位 | 說明 |
+| Field | Notes |
 |---|---|
-| steps / sampler / scheduler / seed | 跟 KSampler 一樣 |
-| cfg | **必須 1.0**（H3 是 flow-matching） |
-| denoise | `0–1`，不是 12 |
-| shift_video / shift_audio | 預設 12 / 3 |
+| steps / sampler / scheduler / seed | Same as KSampler |
+| cfg | **Must be 1.0** (H3 is flow-matching) |
+| denoise | `0–1`, not 12 |
+| shift_video / shift_audio | Defaults 12 / 3 |
 | server_url | `http://<gpu>:8090/upstream/minimax-h3-ref2va` |
 
-範例：`examples/workflows/h3_remote_ref2va.json`。
+Example: `examples/workflows/h3_remote_ref2va.json`.
 
-遠端：
+Server:
 
 ```bash
 python server/h3_server.py \
@@ -51,45 +53,45 @@ python server/h3_server.py \
   --tp --host 127.0.0.1 --port 8299
 ```
 
-INT8+ConvRot + TP2，2×3080 20GB 可跑。不走 vLLM-omni。llama-swap 跟 LLM 互斥換卡。詳見 `docs/efficiency.md`。
+INT8+ConvRot + TP2 fits 2×3080 20GB. No vLLM-omni. Swap with LLMs via llama-swap. See `docs/efficiency.md`.
 
 ---
 
-## 場景 B — 本地 denoise，遠端 CLIP + VAE（跨圖並行）
+## Scene B — local denoise, remote CLIP + VAE
 
-本地卡狂跑 Sampler。CLIP 32B 和 Video/Audio VAE 丟遠端，用信箱跨 Queue：
+Keep the local card on the Sampler. Ship CLIP 32B and Video/Audio VAE to the GPU box. Mailboxes span Comfy queues:
 
-- 這一輪開頭：Collect 上一輪已經好的 CLIP（開 denoise）和 VAE（存片）
-- 這一輪結尾：Submit 這一輪 decode、Submit 下一輪 encode
+- Start of a round: Collect last CLIP (to denoise) and last VAE (to save the video)
+- End of a round: Submit this decode, Submit next encode
 
-denoise 那幾分鐘，遠端同時在解上一支、編下一支。
+While you denoise, the remote box decodes the previous clip and encodes the next one.
 
-### 怎麼跑
+### How to run
 
-中英逐步：`docs/async-howto.md`。
+Step-by-step (EN/中): `docs/async-howto.md`.
 
-1. **Prefill**（`h3_async_prefill.json`）Queue 一次，信箱先有一筆 CLIP。可以是墊檔。送出就能開主循環。
-2. **第一輪正式**（`h3_ref2va_async_pub.json`）Collect 那筆 CLIP → **本地 denoise** → Decode Submit（留給下一輪開頭）→ Encode Submit（下一輪 CLIP）。VAE Collect 此時空（`audio = False`），用圖裡的 Switch。
-3. **之後每一輪開頭** 抓上一輪 VAE 存片，同時 Collect CLIP 開下一包 denoise。
+1. **Prefill** (`h3_async_prefill.json`) — Queue once so the mailbox has a CLIP job. Dummy is fine. Then start the main loop.
+2. **First real round** (`h3_ref2va_async_pub.json`) — Collect that CLIP → **local denoise** → Decode Submit (for the next start) → Encode Submit (next CLIP). VAE Collect is empty (`audio = False`); the graph Switch handles it.
+3. **Later rounds** — at queue start, Collect last VAE and save; Collect CLIP and denoise the next pack.
 
-這一輪左邊填的素材，是下一輪才 denoise 的。
+Whatever you set on the left this round is what the *next* round denoises.
 
-### 節點
+### Nodes
 
-| 節點 | 作用 |
+| Node | Role |
 |---|---|
-| Pipe Encode Submit / Collect | CLIP 信箱。Collect 空立刻報錯；還在跑會等。Submit 的 `latent` 可接 Collect 通透，輸出同包 latent |
-| Pipe Decode Submit / Collect | AV VAE 信箱。Submit 的 `trigger` 是 latent 通透。Collect 的 `trigger` 只決定順序；沒聲音吐 `False` |
-| Pipe Encode / Decode (sync) | 同一張圖裡等遠端跑完（不用信箱） |
+| Pipe Encode Submit / Collect | CLIP mailbox. Collect errors if empty; waits if still running. Submit `latent` can pipe Collect through |
+| Pipe Decode Submit / Collect | AV VAE mailbox. Submit `trigger` is the same latent. Collect `trigger` is order only; no audio → `False` |
+| Pipe Encode / Decode (sync) | Wait in the same graph (no mailbox) |
 
-`server_url`：
+`server_url`:
 
-| 服務 | URL |
+| Service | URL |
 |---|---|
 | encode | `http://<gpu>:8090/upstream/minimax-h3-clip-encode` |
-| decode | `http://<gpu>:8090/upstream/minimax-h3-vae-decode-1`（單卡，可跟 encode 並掛） |
+| decode | `http://<gpu>:8090/upstream/minimax-h3-vae-decode-1` (1 GPU, can sit next to encode) |
 
-遠端（可同時掛，分卡）：
+Server (both can stay up, split GPUs):
 
 ```bash
 python server/h3_clip_encode.py \
@@ -104,21 +106,21 @@ python server/h3_vae_decode.py \
   --dp 1 --host 127.0.0.1 --port 8300
 ```
 
-請求會先等 `/health` 再送本體；同服務 FIFO 排隊。Kitchen RoPE 只認 `cuda:0`，雙卡 decode 要獨立 process + `CUDA_VISIBLE_DEVICES` remap。
+Calls wait for `/health` before the real POST. Same service is FIFO. Kitchen RoPE only sees `cuda:0`; multi-GPU decode needs one process per card and `CUDA_VISIBLE_DEVICES` remap.
 
-llama-swap 範本：`examples/llama-swap.yaml`（`h3-async` 組：encode 卡 1 + decode-1 卡 0）。
+llama-swap snippet: `examples/llama-swap.yaml` (`h3-async`: encode on GPU 1, decode-1 on GPU 0).
 
 ---
 
-## 硬體參考（2×3080 20GB）
+## Hardware notes (2×3080 20GB)
 
-- 場景 A DiT TP2：閒置約 5GB + 2.2GB。0.3MP ≈ 38–65s/step，0.6MP ≈ 240s/step（attention O(n²)）。
-- 場景 B decode 0.6MP 124 幀：單卡 ≈ 44s；243 幀 672×448 fp32 回條約 880MB。
-- Encode：VAE 先、卸回 RAM、再 CLIP（預留 12GB 給 vision / dequant）。
-- 無 NVLink、BAR1=256MiB：NCCL 只能 SHM/direct。
+- Scene A DiT TP2: idle ~5GB + 2.2GB. 0.3MP ≈ 38–65s/step, 0.6MP ≈ 240s/step (attention is O(n²)).
+- Scene B decode 0.6MP 124 frames: ~44s on 1 GPU; 243×672×448 fp32 pack ≈ 880MB.
+- Encode: VAE first, offload to RAM, then CLIP (keep ~12GB free for vision / dequant).
+- No NVLink, BAR1=256MiB: NCCL is SHM/direct only.
 
-## 文件
+## Docs
 
-- `docs/async-howto.md` — 場景 B 中英步驟
+- `docs/async-howto.md` — Scene B, English + 中文
 - `docs/environment.md` / `docs/efficiency.md`
 - `plan.md` / `decode_plan.md`
