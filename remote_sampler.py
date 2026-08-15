@@ -402,7 +402,7 @@ class RemoteDecodeNode:
 
 
 class RemoteDecodeSubmit:
-    """DVB 信箱：denoise 完立刻丟 160。沒有輸出，避免跟這一輪 latent 搞混。"""
+    """丟 160 做 AV decode。trigger 輸出是進站 latent 原樣通透，只當執行順序。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -416,7 +416,8 @@ class RemoteDecodeSubmit:
             },
         }
 
-    RETURN_TYPES = ()
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("trigger",)
     FUNCTION = "submit"
     OUTPUT_NODE = True
     CATEGORY = "Remote Pipe"
@@ -457,7 +458,7 @@ class RemoteDecodeSubmit:
 
         threading.Thread(target=_work, daemon=True).start()
         print(f"[h3-client] mailbox submit {job_id}", flush=True)
-        return {}
+        return (samples,)
 
 
 class RemoteDecodeCollect:
