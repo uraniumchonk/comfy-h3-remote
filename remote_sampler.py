@@ -303,8 +303,7 @@ class RemoteDecodeNode:
     Denoise 完成的 latent 送到 160 卡 0 做 video VAE decode，
     回傳 ComfyUI IMAGE（[N,H,W,C] fp32 [0,1]）直送 VHS_VideoCombine。
 
-    async：等待遠端期間 10 號機可跑 VAEDecodeAudio 等不依賴 IMAGE 的 node。
-    AUDIO 輸出預留：audio VAE 目前留在 10 號機。
+    async：等待遠端期間 10 號機可跑其他不依賴 IMAGE/AUDIO 的 node。
     """
 
     @classmethod
@@ -349,6 +348,10 @@ class RemoteDecodeSubmit:
     OUTPUT_NODE = True
     CATEGORY = "Remote Pipe"
 
+    @classmethod
+    def IS_CHANGED(cls, *values, **kwargs):
+        return float("NaN")
+
     def submit(self, samples, server_url):
         job_id = uuid.uuid4().hex
         _, jobs_dir = _mailbox_paths()
@@ -369,10 +372,9 @@ class RemoteDecodeSubmit:
         def _work():
             try:
                 result = send_decode_request({"samples": samples}, server_url)
-                frames = result.get("frames")
-                if frames is None:
+                if result.get("frames") is None:
                     raise RuntimeError("decode server returned no frames")
-                torch.save(frames.cpu(), frames_path)
+                torch.save(_serialize(result), frames_path)
                 _mailbox_update(job_id, status="ready")
                 print(f"[h3-client] mailbox ready {job_id}", flush=True)
             except Exception as e:
@@ -385,18 +387,21 @@ class RemoteDecodeSubmit:
 
 
 class RemoteDecodeCollect:
-    """只拿上一輪已經 ready 的畫面。stamp 只決定執行順序，不是這一輪 latent。"""
+    """只 pop 已經 ready 的上一輪畫面。trigger 只決定執行順序，不是這一輪 latent。
+
+    不要等 running：Submit 跟 Collect 都掛在 denoise 後，等 running 會變成收這一輪。
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "stamp": ("*", {}),
+                "trigger": ("*", {}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
     FUNCTION = "collect"
     CATEGORY = "Remote Pipe"
 
@@ -404,25 +409,40 @@ class RemoteDecodeCollect:
     def IS_CHANGED(cls, *values, **kwargs):
         return float("NaN")
 
-    def collect(self, stamp):
-        job = _mailbox_wait(_mailbox_load, "decode")
+    def collect(self, trigger):
+        with _MAILBOX_LOCK:
+            data = _mailbox_load()
+            job = next((j for j in data["jobs"] if j.get("status") == "ready"), None)
+
+        silent = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 32000}
         if job is None:
             print("[h3-client] decode mailbox empty, skip collect", flush=True)
-            return (torch.zeros(1, 8, 8, 3),)
+            return (torch.zeros(1, 8, 8, 3), silent)
 
         path = job.get("frames_path")
         if not path or not os.path.isfile(path):
             _mailbox_update(job["id"], status="error", error="frames file missing")
             raise RuntimeError(f"mailbox job {job['id']} frames missing: {path}")
 
-        frames = torch.load(path, weights_only=False)
-        _mailbox_update(job["id"], status="collected")
+        packed = torch.load(path, weights_only=False)
+        with _MAILBOX_LOCK:
+            data = _mailbox_load()
+            data["jobs"] = [j for j in data["jobs"] if j.get("id") != job["id"]]
+            _mailbox_save(data)
         try:
             os.remove(path)
         except OSError:
             pass
+
+        if isinstance(packed, dict) and "frames" in packed:
+            result = _deserialize(packed)
+            frames, audio = _unpack_decode(result)
+        else:
+            frames, audio = packed, silent
+        if audio is None:
+            audio = silent
         print(f"[h3-client] mailbox collect {job['id']} {list(frames.shape)}", flush=True)
-        return (frames,)
+        return (frames, audio)
 
 
 class RemoteDecodeGet(RemoteDecodeCollect):
