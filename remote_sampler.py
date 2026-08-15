@@ -9,10 +9,14 @@ Wired between:
 """
 import io
 import json
+import os
 import struct
+import tempfile
+import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
+import uuid
 
 import torch
 
@@ -186,7 +190,48 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
 # llama-swap /upstream/<id>：第一次請求會卸載當前模型、拉起 decode 服務
 DEFAULT_DECODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-vae-decode"
 
-_DECODE_JOBS = {}
+_MAILBOX_LOCK = threading.Lock()
+
+
+def _mailbox_paths():
+    try:
+        import folder_paths
+        root = folder_paths.get_output_directory()
+    except Exception:
+        root = os.path.join(os.path.expanduser("~"), "h3_decode_mailbox")
+    jobs_dir = os.path.join(root, "h3_decode_jobs")
+    os.makedirs(jobs_dir, exist_ok=True)
+    return os.path.join(root, "h3_decode_mailbox.json"), jobs_dir
+
+
+def _mailbox_load():
+    path, _ = _mailbox_paths()
+    if not os.path.isfile(path):
+        return {"jobs": []}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or "jobs" not in data:
+        return {"jobs": []}
+    return data
+
+
+def _mailbox_save(data):
+    path, _ = _mailbox_paths()
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _mailbox_update(job_id, **fields):
+    with _MAILBOX_LOCK:
+        data = _mailbox_load()
+        for job in data["jobs"]:
+            if job.get("id") == job_id:
+                job.update(fields)
+                break
+        _mailbox_save(data)
 
 
 def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
@@ -285,7 +330,11 @@ class RemoteDecodeNode:
 
 
 class RemoteDecodeSubmit:
-    """把 latent 丟給 160，立刻回傳 job handle。本地可繼續 denoise / encode。"""
+    """DVB For-Each 信箱：denoise 完立刻丟 160，latent 原樣透傳。
+
+    寫 output/h3_decode_mailbox.json，背景下載畫面到 h3_decode_jobs/{id}.pt。
+    同一輪不要接 Collect 等這一單；Collect 只收上一輪已經 ready 的。
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -299,65 +348,102 @@ class RemoteDecodeSubmit:
             },
         }
 
-    RETURN_TYPES = ("H3_DECODE_JOB",)
-    RETURN_NAMES = ("job",)
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
     FUNCTION = "submit"
     CATEGORY = "MiniMax H3"
 
     def submit(self, samples, server_url):
-        import threading
-        import uuid
-
         job_id = uuid.uuid4().hex
-        _DECODE_JOBS[job_id] = {"status": "running", "result": None, "err": None}
+        _, jobs_dir = _mailbox_paths()
+        frames_path = os.path.join(jobs_dir, job_id + ".pt")
+        rec = {
+            "id": job_id,
+            "status": "running",
+            "server_url": server_url,
+            "frames_path": frames_path,
+            "error": None,
+            "created": time.time(),
+        }
+        with _MAILBOX_LOCK:
+            data = _mailbox_load()
+            data["jobs"].append(rec)
+            _mailbox_save(data)
 
         def _work():
             try:
-                _DECODE_JOBS[job_id]["result"] = send_decode_request(
-                    {"samples": samples}, server_url)
-                _DECODE_JOBS[job_id]["status"] = "done"
+                result = send_decode_request({"samples": samples}, server_url)
+                frames = result.get("frames")
+                if frames is None:
+                    raise RuntimeError("decode server returned no frames")
+                torch.save(frames.cpu(), frames_path)
+                _mailbox_update(job_id, status="ready")
+                print(f"[h3-client] mailbox ready {job_id}", flush=True)
             except Exception as e:
-                _DECODE_JOBS[job_id]["err"] = e
-                _DECODE_JOBS[job_id]["status"] = "error"
+                _mailbox_update(job_id, status="error", error=str(e))
+                print(f"[h3-client] mailbox error {job_id}: {e}", flush=True)
 
         threading.Thread(target=_work, daemon=True).start()
-        print(f"[h3-client] decode submit {job_id}", flush=True)
-        return ({"job_id": job_id},)
+        print(f"[h3-client] mailbox submit {job_id}", flush=True)
+        return (samples,)
 
 
-class RemoteDecodeGet:
-    """用 Submit 的 job handle 取回 IMAGE。可放在下一單 / 另一條支線。"""
+class RemoteDecodeCollect:
+    """DVB For-Each Done：denoise 完串在 Submit 後面，只拿「已經 ready 的舊 job」。
+
+    不會等這一輪剛 Submit 的 running job，所以下一輪 denoise 期間 160 在解上一單，
+    這一輪 Collect 把上一單畫面丟給 VHS。第一輪信箱空：輸出 1 幀黑圖，VHS 可忽略。
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "job": ("H3_DECODE_JOB", {}),
+                "samples": ("LATENT", {}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
+    RETURN_TYPES = ("LATENT", "IMAGE")
+    RETURN_NAMES = ("samples", "images")
     FUNCTION = "collect"
     CATEGORY = "MiniMax H3"
 
-    async def collect(self, job):
-        import asyncio
-        import comfy.model_management as mm
+    @classmethod
+    def IS_CHANGED(cls, *values, **kwargs):
+        return float("NaN")
 
-        job_id = job["job_id"] if isinstance(job, dict) else job
-        rec = _DECODE_JOBS.get(job_id)
-        if rec is None:
-            raise RuntimeError(f"unknown decode job {job_id}")
-        while rec["status"] == "running":
-            if mm.processing_interrupted():
-                mm.throw_exception_if_processing_interrupted()
-            await asyncio.sleep(0.2)
-        if rec["status"] == "error":
-            raise rec["err"]
-        result = rec["result"]
-        del _DECODE_JOBS[job_id]
-        return _unpack_decode(result)
+    def collect(self, samples):
+        with _MAILBOX_LOCK:
+            data = _mailbox_load()
+            job = None
+            for j in data["jobs"]:
+                if j.get("status") == "ready":
+                    job = j
+                    break
+
+        if job is None:
+            print("[h3-client] mailbox empty, skip collect", flush=True)
+            dummy = torch.zeros(1, 8, 8, 3)
+            return (samples, dummy)
+
+        path = job.get("frames_path")
+        if not path or not os.path.isfile(path):
+            _mailbox_update(job["id"], status="error", error="frames file missing")
+            raise RuntimeError(f"mailbox job {job['id']} frames missing: {path}")
+
+        frames = torch.load(path, weights_only=False)
+        _mailbox_update(job["id"], status="collected")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        print(f"[h3-client] mailbox collect {job['id']} {list(frames.shape)}", flush=True)
+        return (samples, frames)
+
+
+class RemoteDecodeGet(RemoteDecodeCollect):
+    """舊名：跟 Collect 同一顆（信箱 pop），不再吃 RAM job handle。"""
+    pass
 
 
 class RemoteDenoiseSampler:
