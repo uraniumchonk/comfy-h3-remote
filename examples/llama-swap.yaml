@@ -1,17 +1,19 @@
+# llama-swap 片段。路徑改成你的。
+#
+# h3-sync：DiT 跟 DP2 decode 互斥
+# h3-async：卡 0 decode-1 + 卡 1 encode，可同時掛
+
 models:
   minimax-h3-ref2va:
     env:
       - "CUDA_VISIBLE_DEVICES=0,1"
       - "CUDA_DEVICE_ORDER=PCI_BUS_ID"
-      - "COMFYUI_ROOT=/path/to/ComfyUI"
       - "PYTHONPATH=/path/to/ComfyUI"
-      - "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64"
+      - "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128"
     cmd: |
       /path/to/ComfyUI/.venv/bin/python3 /path/to/comfy-h3-remote/server/h3_server.py \
         --model /path/to/minimax_h3_ref2va_pruned_int8_convrot.safetensors \
-        --tp \
-        --host 127.0.0.1 \
-        --port ${PORT}
+        --tp --host 127.0.0.1 --port ${PORT}
     checkEndpoint: /health
     ttl: 0
     unloadTimeout: 30
@@ -23,5 +25,68 @@ models:
       idleConn: 7200
     name: "MiniMax H3 Ref2VA INT8 TP2"
 
+  minimax-h3-vae-decode:
+    env:
+      - "CUDA_VISIBLE_DEVICES=0,1"
+      - "CUDA_DEVICE_ORDER=PCI_BUS_ID"
+      - "PYTHONPATH=/path/to/ComfyUI"
+      - "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64"
+    cmd: |
+      /path/to/ComfyUI/.venv/bin/python3 /path/to/comfy-h3-remote/server/h3_vae_decode.py \
+        --video-vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+        --audio-vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+        --dp 2 --host 127.0.0.1 --port ${PORT}
+    checkEndpoint: /health
+    ttl: 0
+    name: "MiniMax H3 AV Decode DP2"
+
+  minimax-h3-vae-decode-1:
+    env:
+      - "CUDA_VISIBLE_DEVICES=0"
+      - "CUDA_DEVICE_ORDER=PCI_BUS_ID"
+      - "PYTHONPATH=/path/to/ComfyUI"
+      - "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64"
+    cmd: |
+      /path/to/ComfyUI/.venv/bin/python3 /path/to/comfy-h3-remote/server/h3_vae_decode.py \
+        --video-vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+        --audio-vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+        --dp 1 --host 127.0.0.1 --port ${PORT}
+    checkEndpoint: /health
+    ttl: 0
+    name: "MiniMax H3 AV Decode 1GPU"
+
+  minimax-h3-clip-encode:
+    env:
+      - "CUDA_VISIBLE_DEVICES=1"
+      - "CUDA_DEVICE_ORDER=PCI_BUS_ID"
+      - "PYTHONPATH=/path/to/ComfyUI"
+      - "PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:64"
+    cmd: |
+      /path/to/ComfyUI/.venv/bin/python3 /path/to/comfy-h3-remote/server/h3_clip_encode.py \
+        --clip /path/to/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+        --video-vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+        --audio-vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+        --host 127.0.0.1 --port ${PORT}
+    checkEndpoint: /health
+    ttl: 0
+    name: "MiniMax H3 CLIP Encode 1GPU"
+
+groups:
+  h3-sync:
+    swap: true
+    exclusive: true
+    members:
+      - minimax-h3-ref2va
+      - minimax-h3-vae-decode
+  h3-async:
+    swap: false
+    exclusive: false
+    members:
+      - minimax-h3-clip-encode
+      - minimax-h3-vae-decode-1
+
 aliases:
   h3: minimax-h3-ref2va
+  h3-decode: minimax-h3-vae-decode
+  h3-decode-1: minimax-h3-vae-decode-1
+  h3-encode: minimax-h3-clip-encode

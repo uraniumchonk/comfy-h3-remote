@@ -1,95 +1,122 @@
-# ComfyUI Remote Denoise (MiniMax H3)
+# Remote Pipe（MiniMax H3）
 
-## Goal
+把 MiniMax H3 的重活（CLIP encode、DiT denoise、Video/Audio VAE decode）丟到 GPU 伺服器。ComfyUI 客戶端只跑圖、Queue、存影片。
 
-Run MiniMax H3 Ref2VA denoise inside ComfyUI with multi-GPU tensor parallelism (TP2 / TP4). Anyone running local LLMs already owns a multi-GPU server — that same box can also run compute-heavy ComfyUI video generation and benefit from multi-GPU acceleration. The client only runs CLIP / VAE / Ref2VA encoding; the DiT runs sharded across GPUs on a remote box, and the denoised latent is sent back to the client for decoding.
+兩種用法：
 
-## Problems solved
+- **同步**：這一輪等遠端跑完再往下。接線最少。
+- **跨圖非同步**：Submit 丟出去立刻結束，下一輪 Collect 再取結果。denoise 的幾十分鐘裡，160 可以同時解上一支、編下一支。
 
-- **ComfyUI has no multi-GPU TP out of the box**: MiniMax H3 Ref2VA actually fits on a single GPU, but if you own a 2 / 4-GPU server, those idle cards are wasted potential — video generation is extremely compute-heavy, exactly where multi-GPU acceleration pays off the most. ComfyUI DiTs only run on one GPU by default; multi-GPU TP simply doesn't exist natively. `server/h3_tp.py` implements Megatron-style TP from scratch: qkv / fc1 are column-parallel (QKV / SwiGLU use index maps, not naive half-splits), out / fc2 are row-parallel with all-reduce, and it scales to 2 or 4 cards with all 50 DiT blocks evenly spread across them.
-- **No vLLM-omni, no giant full BF16 models**: the alternative route is dumping the full BF16 model into vLLM-omni, which needs a huge number of big cards. This project uses INT8+ConvRot quantization + TP instead, so 2× RTX 3080 20GB is enough for short clips.
-- **NCCL without P2P**: these cards have no NVLink and BAR1 is only 256MiB (`can_device_access_peer` = False), so P2P is impossible. `torch.cuda.nccl` falls back to SHM / direct host staging — measured 0.76ms for a 2M-element all-reduce and broadcast is ~2× faster than `.to()`. The server disables P2P / IB at startup and warms up one communicator at load time.
-- **Block-wise CPU offload (Comfy lowvram / Wan2GP / Omni DLO style)**: 50 blocks stay in pinned RAM; while layer *i* computes, layer *i+1* is prefetched onto the cards. The first `resident` layers (auto-sized from free VRAM) stay resident to cut the per-layer PCIe sync. AdaLN projections (0.5–1GB each) stay on CPU — only the few-KB gates cross.
-- **Simplified wiring (bonus)**: the official template requires a chain of nodes — `UNETLoader → BasicGuider`, `RandomNoise + KSamplerSelect + BasicScheduler → SamplerCustomAdvanced` — and the client has to load UNET. This node collapses the whole chain into one; the client never loads UNET or touches samplers.
-- **GPU sharing (bonus)**: the GPU box can sit behind llama-swap and swap exclusively with LLMs. H3 is only loaded when needed; the rest of the time the cards serve vLLM / LLM. One machine, two jobs.
+## 為什麼要拆機
 
-## Client
+H3 的 DiT 吃多卡、CLIP 32B、Video VAE 也大。客戶端（例如單張 4070）不該載這些。GPU 箱本來就在跑 LLM，用 llama-swap 跟 H3 互斥換卡：要出片時載 H3，平時把卡還給 vLLM。
+
+DiT 走本專案的 INT8+ConvRot + TP2（`server/h3_tp.py`），2×3080 20GB 就能跑。不走 vLLM-omni / 整包 BF16。
+
+## 安裝（客戶端）
 
 ```text
 cd ComfyUI/custom_nodes
-git clone https://github.com/uraniumchonk/comfy-h3-remote ComfyUI-RemoteDenoiseH3
+git clone https://github.com/uraniumchonk/comfy-h3-remote RemotePipe
 ```
 
-Restart ComfyUI. Menu: `MiniMax H3` → `Remote Denoise Node (H3)`.
+重啟 ComfyUI。選單分類：`Remote Pipe`。
 
-## Wiring
-
-The official template requires a chain of samplers:
-
-```text
-UNETLoader → BasicGuider
-RandomNoise + KSamplerSelect + BasicScheduler → SamplerCustomAdvanced
-MiniMaxH3ReferenceToVideo ──latent/cond──▶ SamplerCustomAdvanced ──▶ VAE Decode
-```
-
-This node absorbs that whole chain. Replace it with:
-
-```text
-MiniMaxH3ReferenceToVideo
-        │ positive          │ LATENT
-        ▼                   ▼
-        └────── Remote Denoise Node (H3) ──────┐
-                                               ▼
-                          VAEDecode + VAEDecodeAudio → Video Combine
-```
-
-The client must not load UNET, and must not wire up KSampler / SamplerCustomAdvanced / Guider / Scheduler / RandomNoise.
-
-| Field | Meaning |
+| 節點 | 作用 |
 |---|---|
-| steps / sampler / scheduler / seed | Same as on KSampler |
-| cfg | **Always 1.0 for H3.** H3 is flow-matching; the official template uses BasicGuider (cfg=1.0, no CFG). Any cfg > 1 amplifies positive/negative error and the output comes out as snow/black. |
-| denoise | `0–1`. **NOT 12** |
-| shift_video | Default `12` |
-| shift_audio | Default `3` |
-| server_url | See below |
+| Pipe Encode (sync) | 官方 Ref2VA 整段（CLIP + ref VAE）丟 160，等結果 |
+| Pipe Encode Submit / Collect | 跨圖信箱：Submit 立刻丟，下一輪 Collect 拿 positive + latent |
+| Pipe Denoise | 遠端 DiT。取代 UNET + Guider + Sampler 那串 |
+| Pipe Decode (sync) | 遠端 video + audio VAE，等畫面和聲音 |
+| Pipe Decode Submit / Collect | 跨圖信箱：Submit 丟 AV latent；Collect 的 `trigger` 只決定執行順序，輸出 `images` + `audio` |
+| Pipe LoRA Stack | 多顆 LoRA 串給 Denoise |
 
-There is a `fixed` / `randomize` toggle after seed (added automatically by Comfy). Don't leave it out when saving the workflow, or 12 will leak into denoise.
+## 同步（一張圖跑完）
 
-`server_url`:
+```text
+素材 / prompt
+    → Pipe Encode (sync) → positive + latent
+    → Pipe Denoise
+    → Pipe Decode (sync) → images + audio → VHS
+```
 
-- llama-swap: `http://192.168.0.160:8090/upstream/minimax-h3-ref2va`
-- Direct: `http://<gpu-box>:8299`
+`server_url` 預設：
 
-## Server
+| 服務 | URL |
+|---|---|
+| encode | `http://<gpu>:8090/upstream/minimax-h3-clip-encode` |
+| denoise | `http://<gpu>:8090/upstream/minimax-h3-ref2va` |
+| decode | `http://<gpu>:8090/upstream/minimax-h3-vae-decode`（DP2）或 `.../minimax-h3-vae-decode-1`（單卡） |
 
-Requires ComfyUI 0.30+ (MiniMax H3 + comfy_kitchen) and INT8+ConvRot weights. The weights are not in this repo.
+Denoise：`cfg` 必須 1.0（H3 是 flow-matching）。turbo LoRA 用 `euler` 4～8 step。
+
+## 跨圖非同步（串行加速）
+
+同一張 pipeline 反覆 Queue。**這一輪左邊填的素材，是下一輪才 denoise 的。**
+
+先跑一次 Prefill（只 Submit encode），再進 pipeline：
+
+```text
+Prefill     Encode Submit A
+Queue 1     Encode Collect A → Denoise A → Decode Submit A
+            denoise 完再 Encode Submit B
+Queue 2     Encode Collect B → Denoise B → Decode Submit B
+            Decode Collect.trigger → VHS 存出 A（images + audio）
+```
+
+接線重點：
+
+- Decode Submit 接 **這一輪** denoise 的 LATENT，沒有輸出。
+- Decode Collect 的 `trigger` 也接 denoise（只為了等它跑完），**不要**當成「解這一輪」。輸出是上一輪已經 ready 的畫面和聲音。
+- 第一輪 Collect 信箱空：8×8 黑圖 + 靜音，正常。
+- Encode Collect：上一輪 encode 還在跑就堵住等；真的沒上一輪才報錯。
+
+信箱在客戶端 `ComfyUI/output/h3_*_mailbox.json`，本體在 `h3_*_jobs/`。
+
+## 伺服器
+
+需要 ComfyUI 0.30+（MiniMax H3 + comfy_kitchen）和 INT8+ConvRot 權重（不在本 repo）。
 
 ```bash
-export COMFYUI_ROOT=/path/to/ComfyUI
+# DiT TP2
 python server/h3_server.py \
   --model /path/to/minimax_h3_ref2va_pruned_int8_convrot.safetensors \
-  --tp --host 0.0.0.0 --port 8299
+  --tp --host 127.0.0.1 --port 8299
+
+# CLIP encode（單卡，權重 offload 到 RAM）
+python server/h3_clip_encode.py \
+  --clip /path/to/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+  --video-vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --audio-vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+  --host 127.0.0.1 --port 8301
+
+# VAE decode（video + audio；--dp 1 單卡 / 2 雙卡 chunk）
+python server/h3_vae_decode.py \
+  --video-vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --audio-vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+  --dp 1 --host 127.0.0.1 --port 8300
 ```
 
-`--tp`: tensor parallelism. Currently runs TP2 (`h3_server.py` calls `apply_tp` with the default 2 devices); the index-map sharding in `h3_tp.py` itself supports 2 / 4 cards (heads 56, FFN 14336, inner 7168 all divide evenly by 4) — to go TP4, just wire `apply_tp`'s devices parameter to 4 cards. QKV / SwiGLU are cut with index maps, not naive half-splits; out / fc2 use row-parallel + all-reduce.
+llama-swap 範本：`examples/llama-swap.yaml`。
 
-llama-swap template: `examples/llama-swap.yaml`. Load via `/upstream/minimax-h3-ref2va/health`, unload via `POST /api/models/unload`.
+建議分兩組：
 
-## VRAM & performance (reference: 2× RTX 3080 20GB TP2)
+- **同步**：`minimax-h3-ref2va` 跟 `minimax-h3-vae-decode`（DP2）互斥換卡
+- **非同步**：`minimax-h3-clip-encode`（卡 1）跟 `minimax-h3-vae-decode-1`（卡 0）可同時掛著
 
-- Idle after load: `cuda:0 ≈ 5GB / cuda:1 ≈ 2.2GB` (leftovers on 0, AdaLN on CPU, prefix auto-sized).
-- 0.3MP: ~65s/step. 0.6MP: ~240s/step — the 3.7× jump for 2× pixels is attention `O(n²)`, not the TP layer.
-- A 10-second 0.3MP clip will saturate both cards. Lower duration / megapixels, or go TP4 to spread across more cards.
-- One line per step in the server log: `[h3-server] step 3/20  65.1s  elapsed 195.3s`.
+Kitchen RoPE/dlpack 只認 `cuda:0`。雙卡 decode 必須獨立 process + `CUDA_VISIBLE_DEVICES` remap，不能同進程雙卡。
 
-## Next up: sequence parallel (plan.md)
+## 硬體參考（2× RTX 3080 20GB）
 
-TP is at its efficiency ceiling for this hardware (0.75 × 2 cards, no P2P). The next win is Ulysses-style sequence parallel for attention — see `plan.md` (240s → ~150–170s expected for 0.6MP).
+- DiT TP2 閒置：`cuda:0 ≈ 5GB / cuda:1 ≈ 2.2GB`。0.3MP ≈ 38–65s/step，0.6MP ≈ 240s/step（attention O(n²)，TP 不減總 FLOPs）。
+- Decode 0.6MP 124 幀：單卡 ≈ 44s，DP2 ≈ 27s。
+- Encode：VAE 先、卸回 RAM、再 CLIP（預留 12GB 給 vision / INT8 dequant）。圖+短影片大約數十秒；長參考影片會更久，但不应 OOM。
+- 無 NVLink、BAR1=256MiB：NCCL 只能 SHM/direct。
 
-## Docs
+## 文件
 
-- `docs/environment.md` — 兩台機器部署環境快照（GPU 伺服器 192.168.0.160 / Windows 客戶端 192.168.0.10）
-- `docs/efficiency.md` — 雙 3080 TP2 vs 4070TiS 的算力與 step 時間拆帳（0.75 效率為 vLLM 實測）
-- `examples/workflows/h3_remote_ref2va.json` — 正式工作流（含 RemoteDenoiseNode，可直接匯入 ComfyUI）
-- `plan.md` — sequence parallel 實作計劃（Ulysses-style attention）
+- `docs/environment.md` — 部署環境
+- `docs/efficiency.md` — TP2 效率帳
+- `examples/workflows/` — 工作流（async 範例另補）
+- `plan.md` — sequence parallel
+- `decode_plan.md` — decode 架構筆記
