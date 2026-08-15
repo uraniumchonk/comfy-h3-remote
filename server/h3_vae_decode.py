@@ -10,9 +10,11 @@ import argparse
 import asyncio
 import gc
 import io
+import itertools
 import multiprocessing as mp
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
@@ -255,14 +257,31 @@ def decode_video(z, world=1):
 
 
 def decode_audio(audio_z):
-    """官方 VAEDecodeAudio：音訊 latent → {waveform, sample_rate}。"""
-    wave = AUDIO_VAE.decode(audio_z).movedim(-1, 1)
+    """官方數值：first_stage_model.decode → [B,2,L]，再 std 正規化。
+
+    不走 VAE.decode wrapper：video 剛解完卡是滿的，wrapper 整包失敗會誤用 2D tiled。
+    """
+    fs = AUDIO_VAE.first_stage_model
+    z = audio_z.to(device=DEVICE, dtype=next(fs.parameters()).dtype)
+    with torch.no_grad():
+        wave = fs.decode(z).float()
     std = torch.std(wave, dim=[1, 2], keepdim=True) * 5.0
     std[std < 1.0] = 1.0
     wave = wave / std
     sr = getattr(AUDIO_VAE, "audio_sample_rate_output",
                  getattr(AUDIO_VAE, "audio_sample_rate", 32000))
     return {"waveform": wave.contiguous().cpu(), "sample_rate": int(sr)}
+
+
+def _video_to_cpu():
+    if VIDEO_VAE is not None and VIDEO_VAE.first_stage_model is not None:
+        VIDEO_VAE.first_stage_model.to("cpu")
+    torch.cuda.empty_cache()
+
+
+def _video_to_gpu():
+    if VIDEO_VAE is not None and VIDEO_VAE.first_stage_model is not None:
+        VIDEO_VAE.first_stage_model.to(DEVICE, dtype=torch.float16).eval()
 
 
 def run_decode(samples, world=1):
@@ -289,13 +308,18 @@ def run_decode(samples, world=1):
 
     tv = time.time()
     frames = decode_video(video_z, world=world)
+    frames = frames.cpu()
     print(f"[h3-decode] video decode world={world} {time.time() - tv:.1f}s "
           f"frames={list(frames.shape)}", flush=True)
 
     audio = None
     if audio_z is not None and AUDIO_VAE is not None:
+        _video_to_cpu()
         ta = time.time()
-        audio = decode_audio(audio_z)
+        try:
+            audio = decode_audio(audio_z)
+        finally:
+            _video_to_gpu()
         print(f"[h3-decode] audio decode {time.time() - ta:.1f}s "
               f"wave={list(audio['waveform'].shape)} sr={audio['sample_rate']}",
               flush=True)
@@ -313,14 +337,31 @@ def run_decode(samples, world=1):
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import Response  # noqa: E402
 
-app = FastAPI(title="MiniMax H3 Remote Video Decode")
+app = FastAPI(title="MiniMax H3 Remote AV Decode")
 _POOL = ThreadPoolExecutor(max_workers=1)
+_QDEPTH = 0
+_QLOCK = threading.Lock()
+_QID = itertools.count(1)
+
+
+def _run_queued(fn, *args):
+    global _QDEPTH
+    with _QLOCK:
+        _QDEPTH += 1
+        jid = next(_QID)
+        waiting = _QDEPTH - 1
+    print(f"[h3-decode] queue job={jid} waiting={waiting}", flush=True)
+    try:
+        return fn(*args)
+    finally:
+        with _QLOCK:
+            _QDEPTH -= 1
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "video_vae": VIDEO_VAE is not None,
-            "audio_vae": AUDIO_VAE is not None, "dp": _WORLD}
+            "audio_vae": AUDIO_VAE is not None, "dp": _WORLD, "queue": _QDEPTH}
 
 
 @app.get("/progress")
@@ -337,7 +378,7 @@ async def decode_endpoint(request: Request):
         data = load_bytes(body)
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
-            _POOL, run_decode, data.get("samples"), _WORLD)
+            _POOL, _run_queued, run_decode, data.get("samples"), _WORLD)
         payload = dump_bytes(result)
         print(f"[h3-decode] 回傳 {len(payload)/1e6:.1f}MB", flush=True)
         return Response(content=payload, media_type="application/octet-stream")

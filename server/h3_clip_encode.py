@@ -11,9 +11,11 @@ MiniMax H3 遠端 encode server（官方 MiniMaxH3ReferenceToVideo 路徑）
 import argparse
 import asyncio
 import io
+import itertools
 import math
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -258,11 +260,29 @@ def run_encode(data):
 
 app = FastAPI(title="MiniMax H3 Remote Encode")
 _POOL = ThreadPoolExecutor(max_workers=1)
+_QDEPTH = 0
+_QLOCK = threading.Lock()
+_QID = itertools.count(1)
+
+
+def _run_queued(fn, *args):
+    global _QDEPTH
+    with _QLOCK:
+        _QDEPTH += 1
+        jid = next(_QID)
+        waiting = _QDEPTH - 1
+    print(f"[h3-encode] queue job={jid} waiting={waiting}", flush=True)
+    try:
+        return fn(*args)
+    finally:
+        with _QLOCK:
+            _QDEPTH -= 1
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "clip": CLIP is not None, "video_vae": VIDEO_VAE is not None}
+    return {"status": "ok", "clip": CLIP is not None, "video_vae": VIDEO_VAE is not None,
+            "queue": _QDEPTH}
 
 
 @app.get("/progress")
@@ -278,7 +298,7 @@ async def encode_endpoint(request: Request):
         print(f"[h3-encode] /encode {len(body)/1e6:.1f}MB", flush=True)
         data = load_bytes(body)
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_POOL, run_encode, data)
+        result = await loop.run_in_executor(_POOL, _run_queued, run_encode, data)
         payload = dump_bytes(result)
         print(f"[h3-encode] 回傳 {len(payload)/1e6:.1f}MB", flush=True)
         return Response(content=payload, media_type="application/octet-stream")
