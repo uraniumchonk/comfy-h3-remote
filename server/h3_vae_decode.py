@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
-MiniMax H3 遠端 video decode server（跑在 192.168.0.160，卡 0）
+MiniMax H3 遠端 AV decode server
 
-接收 denoise 完成的 latent（AV NestedTensor 標記 dict，只取 video 半邊），
-在本機 GPU 跑 video VAE（ViT3D 36 層 transformer decoder）decode。
-回傳：
-  frames: [N, H, W, C] fp32 [0,1]（ComfyUI IMAGE 標準格式，直送 VHS_VideoCombine）
-
-audio VAE 留在 10 號機（工作流 VAEDecodeAudio 節點不變）。
-
-數值行為對齊 160 執行樹 ComfyUI 0.33.0：
-  - MiniMaxH3VideoVAE.decode 直接輸出 [0,1] fp32（_finalize_pixels）
-10 號機（0.30.0）VAEDecode 的 wrapper 會把 [-1,1] 轉回 [0,1]，最終格式一致。
-
-通訊協定同 h3_server.py：POST /decode，body = torch.save(bytes)。
+接收 denoise 完成的 NestedTensor(video, audio)：
+  video → frames [N,H,W,C] fp32 [0,1]
+  audio → {waveform, sample_rate}（官方 VAEDecodeAudio）
 """
 import argparse
 import asyncio
@@ -81,6 +72,7 @@ def load_bytes(b):
 # ---------------------------------------------------------------------------
 
 VIDEO_VAE = None   # comfy.sd.VAE wrapper（video，fp16）
+AUDIO_VAE = None   # comfy.sd.VAE wrapper（audio，fp32）
 _VIDEO_VAE_PATH = None
 _WORLD = 1          # decode 並行卡數（--dp）
 _DP_MODELS = {}     # unused (process 路徑不在父進程持有卡1模型)
@@ -92,9 +84,9 @@ PROGRESS = {"status": "idle", "elapsed": 0.0}
 # _dp_process_main 已拆到 h3_vae_dp_worker.py（避免 spawn 重 import 本檔時 torch 先初始化）
 
 
-def load_vae(video_path):
-    """載入 video VAE。world>1 時 spawn 獨立進程持有額外卡。"""
-    global VIDEO_VAE, _VIDEO_VAE_PATH
+def load_vae(video_path, audio_path=None):
+    """載入 video VAE。world>1 時 spawn 獨立進程持有額外卡。audio 可選。"""
+    global VIDEO_VAE, AUDIO_VAE, _VIDEO_VAE_PATH
     t0 = time.time()
     print(f"[h3-decode] 載入 video VAE: {video_path}", flush=True)
     _VIDEO_VAE_PATH = video_path
@@ -102,6 +94,13 @@ def load_vae(video_path):
     VIDEO_VAE = VAE(sd=sd, metadata=metadata)
     VIDEO_VAE.first_stage_model.to(DEVICE, dtype=torch.float16).eval()
     print(f"[h3-decode] video VAE cuda:0 就緒 {time.time() - t0:.1f}s", flush=True)
+    if audio_path:
+        t1 = time.time()
+        print(f"[h3-decode] 載入 audio VAE: {audio_path}", flush=True)
+        sd, metadata = comfy.utils.load_torch_file(audio_path, return_metadata=True)
+        AUDIO_VAE = VAE(sd=sd, metadata=metadata)
+        AUDIO_VAE.first_stage_model.to(DEVICE).eval()
+        print(f"[h3-decode] audio VAE 就緒 {time.time() - t1:.1f}s", flush=True)
     if _WORLD > 1:
         ctx = mp.get_context("spawn")
         for r in range(1, _WORLD):
@@ -255,12 +254,19 @@ def decode_video(z, world=1):
     return out.reshape(-1, out.shape[-3], out.shape[-2], out.shape[-1])
 
 
-def run_decode(samples, world=1):
-    """samples: NestedTensor(video, audio) / tensor / {"samples": ...}。
+def decode_audio(audio_z):
+    """官方 VAEDecodeAudio：音訊 latent → {waveform, sample_rate}。"""
+    wave = AUDIO_VAE.decode(audio_z).movedim(-1, 1)
+    std = torch.std(wave, dim=[1, 2], keepdim=True) * 5.0
+    std[std < 1.0] = 1.0
+    wave = wave / std
+    sr = getattr(AUDIO_VAE, "audio_sample_rate_output",
+                 getattr(AUDIO_VAE, "audio_sample_rate", 32000))
+    return {"waveform": wave.contiguous().cpu(), "sample_rate": int(sr)}
 
-    只取 video 半邊（NestedTensor unbind()[0]），audio 留給 10 號機。
-    world: 1 = 單卡，2/4 = chunk 級 DP。
-    """
+
+def run_decode(samples, world=1):
+    """samples: NestedTensor(video, audio) / tensor / dict with samples."""
     t0 = time.time()
     PROGRESS.update(status="running", elapsed=0.0)
 
@@ -268,10 +274,13 @@ def run_decode(samples, world=1):
         samples = samples["samples"]
 
     video_z = None
+    audio_z = None
     if isinstance(samples, comfy.nested_tensor.NestedTensor):
         ts = samples.tensors
         if ts:
             video_z = ts[0]
+        if ts is not None and len(ts) > 1:
+            audio_z = ts[-1]
     elif isinstance(samples, torch.Tensor):
         video_z = samples
 
@@ -283,10 +292,18 @@ def run_decode(samples, world=1):
     print(f"[h3-decode] video decode world={world} {time.time() - tv:.1f}s "
           f"frames={list(frames.shape)}", flush=True)
 
+    audio = None
+    if audio_z is not None and AUDIO_VAE is not None:
+        ta = time.time()
+        audio = decode_audio(audio_z)
+        print(f"[h3-decode] audio decode {time.time() - ta:.1f}s "
+              f"wave={list(audio['waveform'].shape)} sr={audio['sample_rate']}",
+              flush=True)
+
     elapsed = time.time() - t0
     PROGRESS.update(status="done", elapsed=elapsed)
     print(f"[h3-decode] 完成 {elapsed:.1f}s", flush=True)
-    return {"frames": frames}
+    return {"frames": frames, "audio": audio}
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +319,8 @@ _POOL = ThreadPoolExecutor(max_workers=1)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "video_vae": VIDEO_VAE is not None, "dp": _WORLD}
+    return {"status": "ok", "video_vae": VIDEO_VAE is not None,
+            "audio_vae": AUDIO_VAE is not None, "dp": _WORLD}
 
 
 @app.get("/progress")
@@ -333,6 +351,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video-vae", required=True,
                         help="minimax_h3_video_vae_fp16.safetensors 路徑")
+    parser.add_argument("--audio-vae", default="",
+                        help="minimax_h3_audio_vae_fp32.safetensors 路徑")
     parser.add_argument("--dp", type=int, default=1,
                         help="decode 並行卡數（1=單卡，2/4=chunk DP）")
     parser.add_argument("--host", default="0.0.0.0")
@@ -341,7 +361,7 @@ def main():
 
     global _WORLD
     _WORLD = args.dp
-    load_vae(args.video_vae)
+    load_vae(args.video_vae, args.audio_vae or None)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
