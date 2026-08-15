@@ -52,26 +52,15 @@ Denoise：`cfg` 必須 1.0（H3 是 flow-matching）。turbo LoRA 用 `euler` 4�
 
 ## 跨圖非同步（串行加速）
 
-同一張 pipeline 反覆 Queue。**這一輪左邊填的素材，是下一輪才 denoise 的。**
+兩張圖：`examples/workflows/h3_async_prefill.json` + `h3_ref2va_async_pub.json`。中英步驟見 `docs/async-howto.md`。
 
-先跑一次 Prefill（只 Submit encode），再進 pipeline：
+1. **Prefill** Queue 一次，信箱裡先有一筆 CLIP。可以是墊檔。送出就能開主循環。
+2. **第一輪正式** Collect 那筆 CLIP → denoise → Decode Submit（留給下一輪開頭）→ Encode Submit（下一輪 CLIP）。VAE Collect 此時是空的（`audio = False`），用工作流裡的 Switch。
+3. **之後每一輪開頭** 抓上一輪 VAE 存片，同時 Collect 下一包 CLIP 開 denoise。
 
-```text
-Prefill     Encode Submit A
-Queue 1     Encode Collect A → Denoise A → Decode Submit A
-            denoise 完再 Encode Submit B
-Queue 2     Encode Collect B → Denoise B → Decode Submit B
-            Decode Collect.trigger → VHS 存出 A（images + audio）
-```
+這一輪填的素材，是下一輪才 denoise 的。
 
-接線重點：
-
-- Decode Submit 接 **這一輪** denoise 的 LATENT，沒有輸出。
-- Decode Collect 的 `trigger` 也接 denoise（只為了等它跑完），**不要**當成「解這一輪」。輸出是上一輪已經 ready 的畫面和聲音。
-- 第一輪 Collect 信箱空：8×8 黑圖 + 靜音，正常。
-- Encode Collect：上一輪 encode 還在跑就堵住等；真的沒上一輪才報錯。
-
-信箱在客戶端 `ComfyUI/output/h3_*_mailbox.json`，本體在 `h3_*_jobs/`。
+Decode Submit 的 `trigger` 是 latent 通透。Decode Collect 的 `trigger` 只決定執行順序；沒聲音吐 `False`。
 
 ## 伺服器
 
@@ -117,6 +106,9 @@ Kitchen RoPE/dlpack 只認 `cuda:0`。雙卡 decode 必須獨立 process + `CUDA
 
 - `docs/environment.md` — 部署環境
 - `docs/efficiency.md` — TP2 效率帳
-- `examples/workflows/` — 工作流（async 範例另補）
+- `docs/async-howto.md` — Prefill + 主循環（中英對照）
+- `examples/workflows/h3_async_prefill.json` — Prefill
+- `examples/workflows/h3_ref2va_async_pub.json` — 主循環
+- `examples/workflows/h3_remote_ref2va.json` — 同步 Remote Denoise
 - `plan.md` — sequence parallel
 - `decode_plan.md` — decode 架構筆記
