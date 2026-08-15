@@ -186,6 +186,8 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
 # llama-swap /upstream/<id>：第一次請求會卸載當前模型、拉起 decode 服務
 DEFAULT_DECODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-vae-decode"
 
+_DECODE_JOBS = {}
+
 
 def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
     """Send decode request. No step progress (decode is single-shot)."""
@@ -229,13 +231,35 @@ def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
     return load_bytes(box["data"])
 
 
+async def send_decode_request_async(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
+    """async 版：await 期間 ComfyUI 可跑其他不依賴此輸出的 node。"""
+    import asyncio
+    import comfy.model_management as mm
+
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(None, send_decode_request, data, server_url, timeout)
+    while not fut.done():
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        await asyncio.sleep(0.2)
+    return await fut
+
+
+def _unpack_decode(result):
+    frames = result.get("frames")
+    audio = result.get("audio")
+    if frames is None:
+        raise RuntimeError("decode server returned no frames")
+    return (frames, audio)
+
+
 class RemoteDecodeNode:
     """
     Denoise 完成的 latent 送到 160 卡 0 做 video VAE decode，
     回傳 ComfyUI IMAGE（[N,H,W,C] fp32 [0,1]）直送 VHS_VideoCombine。
 
-    AUDIO 輸出預留：audio VAE 目前留在 10 號機（VAEDecodeAudio 節點），
-    將來要遷移時把服務與回傳接上即可。
+    async：等待遠端期間 10 號機可跑 VAEDecodeAudio 等不依賴 IMAGE 的 node。
+    AUDIO 輸出預留：audio VAE 目前留在 10 號機。
     """
 
     @classmethod
@@ -255,13 +279,85 @@ class RemoteDecodeNode:
     FUNCTION = "decode"
     CATEGORY = "MiniMax H3"
 
-    def decode(self, samples, server_url):
-        result = send_decode_request({"samples": samples}, server_url)
-        frames = result.get("frames")
-        audio = result.get("audio")  # 預留：server 目前不回 audio
-        if frames is None:
-            raise RuntimeError("decode server returned no frames")
-        return (frames, audio)
+    async def decode(self, samples, server_url):
+        result = await send_decode_request_async({"samples": samples}, server_url)
+        return _unpack_decode(result)
+
+
+class RemoteDecodeSubmit:
+    """把 latent 丟給 160，立刻回傳 job handle。本地可繼續 denoise / encode。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT", {}),
+                "server_url": ("STRING", {
+                    "default": DEFAULT_DECODE_SERVER,
+                    "multiline": False,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("H3_DECODE_JOB",)
+    RETURN_NAMES = ("job",)
+    FUNCTION = "submit"
+    CATEGORY = "MiniMax H3"
+
+    def submit(self, samples, server_url):
+        import threading
+        import uuid
+
+        job_id = uuid.uuid4().hex
+        _DECODE_JOBS[job_id] = {"status": "running", "result": None, "err": None}
+
+        def _work():
+            try:
+                _DECODE_JOBS[job_id]["result"] = send_decode_request(
+                    {"samples": samples}, server_url)
+                _DECODE_JOBS[job_id]["status"] = "done"
+            except Exception as e:
+                _DECODE_JOBS[job_id]["err"] = e
+                _DECODE_JOBS[job_id]["status"] = "error"
+
+        threading.Thread(target=_work, daemon=True).start()
+        print(f"[h3-client] decode submit {job_id}", flush=True)
+        return ({"job_id": job_id},)
+
+
+class RemoteDecodeGet:
+    """用 Submit 的 job handle 取回 IMAGE。可放在下一單 / 另一條支線。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "job": ("H3_DECODE_JOB", {}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
+    FUNCTION = "collect"
+    CATEGORY = "MiniMax H3"
+
+    async def collect(self, job):
+        import asyncio
+        import comfy.model_management as mm
+
+        job_id = job["job_id"] if isinstance(job, dict) else job
+        rec = _DECODE_JOBS.get(job_id)
+        if rec is None:
+            raise RuntimeError(f"unknown decode job {job_id}")
+        while rec["status"] == "running":
+            if mm.processing_interrupted():
+                mm.throw_exception_if_processing_interrupted()
+            await asyncio.sleep(0.2)
+        if rec["status"] == "error":
+            raise rec["err"]
+        result = rec["result"]
+        del _DECODE_JOBS[job_id]
+        return _unpack_decode(result)
 
 
 class RemoteDenoiseSampler:
