@@ -182,6 +182,87 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
 # ComfyUI Nodes
 # ---------------------------------------------------------------------------
 
+# video decode 服務（160 卡 0）。audio decode 預留：目前留在 10 號機本機。
+DEFAULT_DECODE_SERVER = "http://192.168.0.160:8300"
+
+
+def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
+    """Send decode request. No step progress (decode is single-shot)."""
+    import threading
+    import comfy.model_management as mm
+
+    base = server_url.rstrip("/")
+    payload = dump_bytes(data)
+    req = urllib.request.Request(
+        f"{base}/decode",
+        data=payload,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    t0 = time.time()
+    print(f"[h3-client] decode: sending {len(payload)/1e6:.1f}MB to {server_url}...",
+          flush=True)
+
+    box = {"data": None, "err": None}
+
+    def _post():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                box["data"] = resp.read()
+        except Exception as e:
+            box["err"] = e
+
+    th = threading.Thread(target=_post, daemon=True)
+    th.start()
+
+    while th.is_alive():
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        th.join(0.5)
+
+    if box["err"] is not None:
+        raise box["err"]
+    elapsed = time.time() - t0
+    print(f"[h3-client] decode: received {len(box['data'])/1e6:.1f}MB in {elapsed:.1f}s",
+          flush=True)
+    return load_bytes(box["data"])
+
+
+class RemoteDecodeNode:
+    """
+    Denoise 完成的 latent 送到 160 卡 0 做 video VAE decode，
+    回傳 ComfyUI IMAGE（[N,H,W,C] fp32 [0,1]）直送 VHS_VideoCombine。
+
+    AUDIO 輸出預留：audio VAE 目前留在 10 號機（VAEDecodeAudio 節點），
+    將來要遷移時把服務與回傳接上即可。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT", {}),
+                "server_url": ("STRING", {
+                    "default": DEFAULT_DECODE_SERVER,
+                    "multiline": False,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("images", "audio")
+    FUNCTION = "decode"
+    CATEGORY = "MiniMax H3"
+
+    def decode(self, samples, server_url):
+        result = send_decode_request({"samples": samples}, server_url)
+        frames = result.get("frames")
+        audio = result.get("audio")  # 預留：server 目前不回 audio
+        if frames is None:
+            raise RuntimeError("decode server returned no frames")
+        return (frames, audio)
+
+
 class RemoteDenoiseSampler:
     """
     Replaces SamplerCustomAdvanced. Takes the same inputs but sends
