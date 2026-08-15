@@ -58,3 +58,9 @@ Prefill 若是墊檔，第一支廢片刪掉即可。
 | Decode Collect | `trigger` is order only. `audio` is `False` when empty. Grab at round start. |
 
 `cfg` must be **1.0**. H3 is flow-matching.
+
+## Measured / 實測
+
+0.4MP, 10s, 8-step LoRA. Local denoise **91s**. Full Comfy queue **95.90s**. The leftover ~4s is ffmpeg. Everything else is instant — denoise is fully async.
+
+0.4 百萬像素、10 秒、8 步 LoRA。本地 denoise **91 秒**。整張 Queue **95.90 秒**。多的約 4 秒是 ffmpeg。其餘節點瞬間 —— denoise 已完全非同步。
