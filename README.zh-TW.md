@@ -4,6 +4,8 @@
 
 ComfyUI 節點：把 MiniMax H3 的重活丟到 GPU 伺服器。兩個互不綁死的場景。
 
+場景 B 最好的地方：**encoder / decoder 時間無限接近 0**。大頭全在 denoise，也是最久的那步；CLIP 跟 VAE 疊在下一輪 / 上一輪後面。實測 0.4MP / 10 秒 / 8 步 LoRA — **denoise 91 秒，整張 Queue 95.90 秒**（多的約 4 秒是 ffmpeg）。
+
 | | 場景 A | 場景 B |
 |---|---|---|
 | 誰 denoise | 遠端 DiT（TP2） | **本地** Sampler / UNET |
@@ -59,7 +61,7 @@ INT8+ConvRot + TP2，2×3080 20GB 可跑。不走 vLLM-omni。llama-swap 跟 LLM
 
 ## 場景 B — 本地 denoise，遠端 CLIP + VAE（跨圖並行）
 
-本地卡狂跑 Sampler。CLIP 32B 和 Video/Audio VAE 丟遠端，用信箱跨 Queue：
+本地卡狂跑 Sampler。CLIP 32B 和 Video/Audio VAE 丟遠端，信箱跨 Queue，**編解時間被藏掉**，牆上時鐘只剩 denoise：
 
 - 這一輪開頭：Collect 上一輪已經好的 CLIP（開 denoise）和 VAE（存片）
 - 這一輪結尾：Submit 這一輪 decode、Submit 下一輪 encode

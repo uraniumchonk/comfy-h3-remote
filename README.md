@@ -4,6 +4,8 @@
 
 ComfyUI nodes that offload MiniMax H3 heavy work to a GPU box. Two independent scenes.
 
+The point of Scene B is that **encoder and decoder time go to ~0**. Denoise is the only long step; CLIP and VAE hide behind the next / previous queue. Measured: 0.4MP / 10s / 8-step LoRA — **91s denoise, 95.90s full queue** (~4s ffmpeg).
+
 | | Scene A | Scene B |
 |---|---|---|
 | Who denoises | Remote DiT (TP2) | **Local** Sampler / UNET |
@@ -59,7 +61,7 @@ INT8+ConvRot + TP2 fits 2×3080 20GB. No vLLM-omni. Swap with LLMs via llama-swa
 
 ## Scene B — local denoise, remote CLIP + VAE
 
-Keep the local card on the Sampler. Ship CLIP 32B and Video/Audio VAE to the GPU box. Mailboxes span Comfy queues:
+Keep the local card on the Sampler. Ship CLIP 32B and Video/Audio VAE to the GPU box. Mailboxes span Comfy queues so **encode/decode cost vanishes** and wall time is denoise:
 
 - Start of a round: Collect last CLIP (to denoise) and last VAE (to save the video)
 - End of a round: Submit this decode, Submit next encode
