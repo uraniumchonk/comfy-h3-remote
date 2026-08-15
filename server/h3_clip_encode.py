@@ -300,7 +300,7 @@ async def encode_endpoint(request: Request):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(_POOL, _run_queued, run_encode, data)
         payload = dump_bytes(result)
-        print(f"[h3-encode] 回傳 {len(payload)/1e6:.1f}MB", flush=True)
+        print(f"[h3-encode] packed {len(payload)/1e6:.1f}MB wait client", flush=True)
         return Response(content=payload, media_type="application/octet-stream")
     except Exception:
         tb = traceback.format_exc()

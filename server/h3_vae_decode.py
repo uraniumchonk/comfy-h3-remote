@@ -380,7 +380,7 @@ async def decode_endpoint(request: Request):
         result = await loop.run_in_executor(
             _POOL, _run_queued, run_decode, data.get("samples"), _WORLD)
         payload = dump_bytes(result)
-        print(f"[h3-decode] 回傳 {len(payload)/1e6:.1f}MB", flush=True)
+        print(f"[h3-decode] packed {len(payload)/1e6:.1f}MB wait client", flush=True)
         return Response(content=payload, media_type="application/octet-stream")
     except Exception:
         tb = traceback.format_exc()
