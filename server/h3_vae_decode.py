@@ -100,7 +100,8 @@ def decode_video(z):
         # 0.33: decode_temporal 自建 CPU output_buffer，逐 chunk 串流寫出
         out = VIDEO_VAE.first_stage_model.decode(z)  # [B, 3, F, H', W'] fp32
     out = out.permute(0, 2, 3, 4, 1).contiguous()     # [B, F, H', W', 3]
-    return out.reshape(-1, out.shape[-2], out.shape[-1], 3)
+    # 對齊 0.30 VAEDecode 節點：5D -> reshape(-1, H', W', C)
+    return out.reshape(-1, out.shape[-3], out.shape[-2], out.shape[-1])
 
 
 def run_decode(samples):
