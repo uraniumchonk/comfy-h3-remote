@@ -182,8 +182,9 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
 # ComfyUI Nodes
 # ---------------------------------------------------------------------------
 
-# video decode 服務（160 卡 0）。audio decode 預留：目前留在 10 號機本機。
-DEFAULT_DECODE_SERVER = "http://192.168.0.160:8300"
+# video decode 服務（160 卡 0，llama-swap 管理）。audio decode 預留：目前留在 10 號機本機。
+# llama-swap /upstream/<id>：第一次請求會卸載當前模型、拉起 decode 服務
+DEFAULT_DECODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-vae-decode"
 
 
 def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
