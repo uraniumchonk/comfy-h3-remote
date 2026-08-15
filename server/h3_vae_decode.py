@@ -350,7 +350,7 @@ def _run_queued(fn, *args):
         _QDEPTH += 1
         jid = next(_QID)
         waiting = _QDEPTH - 1
-    print(f"[h3-decode] queue job={jid} waiting={waiting}", flush=True)
+    print(f"[h3-decode] queue count={jid} waiting={waiting}", flush=True)
     try:
         return fn(*args)
     finally:
