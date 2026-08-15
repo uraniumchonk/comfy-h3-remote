@@ -223,31 +223,37 @@ def _encode_refs(data, width, height, length):
 
 
 def run_encode(data):
-    """兩段：VAE ref 先上卡 → 卸光 → CLIP（含大包 vision token）再 offload 上卡。"""
+    """兩段：VAE ref 先上卡 → 卸回 RAM → CLIP（大包 vision token）offload 上卡。"""
     t0 = time.time()
     PROGRESS.update(status="running", elapsed=0.0)
-    _free_gpu("before")
-    prompt = data.get("prompt") or ""
-    width = int(data.get("width", 1344))
-    height = int(data.get("height", 768))
-    length = int(data.get("length", 124))
-    print(f"[h3-encode] start {width}x{height} L={length} refs="
-          f"img={bool(data.get('ref_images'))} vid={bool(data.get('ref_videos'))}",
-          flush=True)
+    try:
+        _free_gpu("before")
+        prompt = data.get("prompt") or ""
+        width = int(data.get("width", 1344))
+        height = int(data.get("height", 768))
+        length = int(data.get("length", 124))
+        print(f"[h3-encode] start {width}x{height} L={length} refs="
+              f"img={bool(data.get('ref_images'))} vid={bool(data.get('ref_videos'))}",
+              flush=True)
 
-    latent, ref_items, ref_blocks = _encode_refs(data, width, height, length)
-    _free_gpu("after-vae")
+        latent, ref_items, ref_blocks = _encode_refs(data, width, height, length)
+        _free_gpu("after-vae")
 
-    tokens = CLIP.tokenize(prompt, minimax_ref_items=ref_items)
-    cond = CLIP.encode_from_tokens_scheduled(tokens)
-    if ref_blocks:
-        cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks})
+        tokens = CLIP.tokenize(prompt, minimax_ref_items=ref_items)
+        print("[h3-encode] clip encode (reserve 12G for vision/dequant)", flush=True)
+        cond = CLIP.encode_from_tokens_scheduled(tokens)
+        if ref_blocks:
+            cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks})
 
-    elapsed = time.time() - t0
-    PROGRESS.update(status="done", elapsed=elapsed)
-    print(f"[h3-encode] 完成 {elapsed:.1f}s", flush=True)
-    _free_gpu("after-clip")
-    return {"positive": cond, "latent": latent}
+        elapsed = time.time() - t0
+        PROGRESS.update(status="done", elapsed=elapsed)
+        print(f"[h3-encode] 完成 {elapsed:.1f}s", flush=True)
+        return {"positive": cond, "latent": latent}
+    except Exception:
+        PROGRESS.update(status="error", elapsed=time.time() - t0)
+        raise
+    finally:
+        _free_gpu("after-clip")
 
 
 app = FastAPI(title="MiniMax H3 Remote Encode")
