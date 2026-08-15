@@ -446,6 +446,249 @@ class RemoteDecodeGet(RemoteDecodeCollect):
     pass
 
 
+DEFAULT_ENCODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-clip-encode"
+_ENCODE_MAILBOX = "h3_encode_mailbox.json"
+_ENCODE_JOBS_DIR = "h3_encode_jobs"
+
+
+def _encode_mailbox_paths():
+    try:
+        import folder_paths
+        root = folder_paths.get_output_directory()
+    except Exception:
+        root = os.path.join(os.path.expanduser("~"), "h3_encode_mailbox")
+    jobs_dir = os.path.join(root, _ENCODE_JOBS_DIR)
+    os.makedirs(jobs_dir, exist_ok=True)
+    return os.path.join(root, _ENCODE_MAILBOX), jobs_dir
+
+
+def _encode_box_load():
+    path, _ = _encode_mailbox_paths()
+    if not os.path.isfile(path):
+        return {"jobs": []}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or "jobs" not in data:
+        return {"jobs": []}
+    return data
+
+
+def _encode_box_save(data):
+    path, _ = _encode_mailbox_paths()
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _encode_box_update(job_id, **fields):
+    with _MAILBOX_LOCK:
+        data = _encode_box_load()
+        for job in data["jobs"]:
+            if job.get("id") == job_id:
+                job.update(fields)
+                break
+        _encode_box_save(data)
+
+
+def send_encode_request(data, server_url=DEFAULT_ENCODE_SERVER, timeout=7200):
+    import comfy.model_management as mm
+
+    base = server_url.rstrip("/")
+    payload = dump_bytes(data)
+    req = urllib.request.Request(
+        f"{base}/encode",
+        data=payload,
+        headers={"Content-Type": "application/octet-stream"},
+        method="POST",
+    )
+    t0 = time.time()
+    print(f"[h3-client] encode: sending {len(payload)/1e6:.1f}MB to {server_url}...",
+          flush=True)
+    box = {"data": None, "err": None}
+
+    def _post():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                box["data"] = resp.read()
+        except Exception as e:
+            box["err"] = e
+
+    th = threading.Thread(target=_post, daemon=True)
+    th.start()
+    while th.is_alive():
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        th.join(0.5)
+    if box["err"] is not None:
+        raise box["err"]
+    print(f"[h3-client] encode: received {len(box['data'])/1e6:.1f}MB in {time.time()-t0:.1f}s",
+          flush=True)
+    return load_bytes(box["data"])
+
+
+def _pack_encode_payload(prompt, width, height, length, ref_image_size,
+                         ref_image=None, ref_video=None,
+                         ref_video_audio=None, ref_audio=None):
+    data = {
+        "prompt": prompt,
+        "width": int(width),
+        "height": int(height),
+        "length": int(length),
+        "ref_image_size": ref_image_size,
+    }
+    if ref_image is not None:
+        data["ref_images"] = {"ref_image_0": ref_image}
+    if ref_video is not None:
+        data["ref_videos"] = {"ref_video_0": ref_video}
+    if ref_video_audio is not None:
+        data["ref_video_audios"] = {"ref_video_audio_0": ref_video_audio}
+    if ref_audio is not None:
+        data["ref_audios"] = {"ref_audio_0": ref_audio}
+    return data
+
+
+class RemoteEncodeNode:
+    """同步：官方 MiniMaxH3ReferenceToVideo 整段 encode（CLIP + ref VAE）丟 160。
+
+    回傳 positive + latent，後面直接接 RemoteDenoise。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "width": ("INT", {"default": 1344, "min": 32, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 768, "min": 32, "max": 4096, "step": 32}),
+                "length": ("INT", {"default": 124, "min": 5, "max": 3600, "step": 1}),
+                "ref_image_size": (["match", "max"], {"default": "match"}),
+                "server_url": ("STRING", {
+                    "default": DEFAULT_ENCODE_SERVER,
+                    "multiline": False,
+                }),
+            },
+            "optional": {
+                "ref_image": ("IMAGE",),
+                "ref_video": ("IMAGE",),
+                "ref_video_audio": ("AUDIO",),
+                "ref_audio": ("AUDIO",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "latent")
+    FUNCTION = "encode"
+    CATEGORY = "MiniMax H3"
+
+    async def encode(self, prompt, width, height, length, ref_image_size, server_url,
+                     ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None):
+        import asyncio
+        import comfy.model_management as mm
+
+        data = _pack_encode_payload(
+            prompt, width, height, length, ref_image_size,
+            ref_image, ref_video, ref_video_audio, ref_audio)
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, send_encode_request, data, server_url)
+        while not fut.done():
+            if mm.processing_interrupted():
+                mm.throw_exception_if_processing_interrupted()
+            await asyncio.sleep(0.2)
+        result = await fut
+        return (result["positive"], result["latent"])
+
+
+class RemoteEncodeSubmit:
+    """跨圖信箱：立刻丟 encode，不等結果。下一輪 Collect 再拿 cond。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return RemoteEncodeNode.INPUT_TYPES()
+
+    RETURN_TYPES = ()
+    FUNCTION = "submit"
+    OUTPUT_NODE = True
+    CATEGORY = "MiniMax H3"
+
+    def submit(self, prompt, width, height, length, ref_image_size, server_url,
+               ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None):
+        job_id = uuid.uuid4().hex
+        _, jobs_dir = _encode_mailbox_paths()
+        payload_path = os.path.join(jobs_dir, job_id + ".pt")
+        rec = {
+            "id": job_id,
+            "status": "running",
+            "server_url": server_url,
+            "result_path": payload_path,
+            "error": None,
+            "created": time.time(),
+        }
+        with _MAILBOX_LOCK:
+            data = _encode_box_load()
+            data["jobs"].append(rec)
+            _encode_box_save(data)
+
+        packed = _pack_encode_payload(
+            prompt, width, height, length, ref_image_size,
+            ref_image, ref_video, ref_video_audio, ref_audio)
+
+        def _work():
+            try:
+                result = send_encode_request(packed, server_url)
+                torch.save(_serialize(result), payload_path)
+                _encode_box_update(job_id, status="ready")
+                print(f"[h3-client] encode mailbox ready {job_id}", flush=True)
+            except Exception as e:
+                _encode_box_update(job_id, status="error", error=str(e))
+                print(f"[h3-client] encode mailbox error {job_id}: {e}", flush=True)
+
+        threading.Thread(target=_work, daemon=True).start()
+        print(f"[h3-client] encode mailbox submit {job_id}", flush=True)
+        return ()
+
+
+class RemoteEncodeCollect:
+    """跨圖信箱：拿上一輪已經 ready 的 encode（positive + latent）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "latent")
+    FUNCTION = "collect"
+    CATEGORY = "MiniMax H3"
+
+    @classmethod
+    def IS_CHANGED(cls, *values, **kwargs):
+        return float("NaN")
+
+    def collect(self):
+        with _MAILBOX_LOCK:
+            data = _encode_box_load()
+            job = None
+            for j in data["jobs"]:
+                if j.get("status") == "ready":
+                    job = j
+                    break
+        if job is None:
+            raise RuntimeError("encode mailbox empty — 先跑一輪 RemoteEncodeSubmit")
+        path = job.get("result_path")
+        if not path or not os.path.isfile(path):
+            _encode_box_update(job["id"], status="error", error="result missing")
+            raise RuntimeError(f"encode job {job['id']} result missing")
+        result = _deserialize(torch.load(path, weights_only=False))
+        _encode_box_update(job["id"], status="collected")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        print(f"[h3-client] encode mailbox collect {job['id']}", flush=True)
+        return (result["positive"], result["latent"])
+
+
 class RemoteDenoiseSampler:
     """
     Replaces SamplerCustomAdvanced. Takes the same inputs but sends

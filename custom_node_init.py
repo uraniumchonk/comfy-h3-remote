@@ -1,6 +1,4 @@
-# MiniMax H3 Remote Denoise - ComfyUI Custom Node
-# Client side: sends denoise job to remote server (192.168.0.160)
-# Decode: llama-swap minimax-h3-vae-decode; mailbox Submit/Collect for cross-queue
+# MiniMax H3 Remote — denoise / decode / encode client nodes
 
 from .remote_sampler import (
     RemoteDenoiseSampler,
@@ -10,6 +8,9 @@ from .remote_sampler import (
     RemoteDecodeSubmit,
     RemoteDecodeCollect,
     RemoteDecodeGet,
+    RemoteEncodeNode,
+    RemoteEncodeSubmit,
+    RemoteEncodeCollect,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -19,6 +20,9 @@ NODE_CLASS_MAPPINGS = {
     "RemoteDecodeSubmit": RemoteDecodeSubmit,
     "RemoteDecodeCollect": RemoteDecodeCollect,
     "RemoteDecodeGet": RemoteDecodeGet,
+    "RemoteEncodeNode": RemoteEncodeNode,
+    "RemoteEncodeSubmit": RemoteEncodeSubmit,
+    "RemoteEncodeCollect": RemoteEncodeCollect,
     "H3LoraStack": H3LoraStack,
 }
 
@@ -29,5 +33,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RemoteDecodeSubmit": "Remote Decode Submit (H3)",
     "RemoteDecodeCollect": "Remote Decode Collect (H3)",
     "RemoteDecodeGet": "Remote Decode Collect (H3)",
+    "RemoteEncodeNode": "Remote Encode Node (H3)",
+    "RemoteEncodeSubmit": "Remote Encode Submit (H3)",
+    "RemoteEncodeCollect": "Remote Encode Collect (H3)",
     "H3LoraStack": "H3 LoRA Stack",
 }
