@@ -687,17 +687,22 @@ class RemoteEncodeSubmit:
         types = RemoteEncodeNode.INPUT_TYPES()
         types.setdefault("optional", {})
         types["optional"]["trigger"] = ("LATENT",)
+        types["optional"]["latent"] = ("LATENT",)
         return types
 
-    RETURN_TYPES = ("INT",)
-    RETURN_NAMES = ("queued",)
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
     FUNCTION = "submit"
     OUTPUT_NODE = True
     CATEGORY = "Remote Pipe"
 
+    @classmethod
+    def IS_CHANGED(cls, *values, **kwargs):
+        return float("NaN")
+
     def submit(self, prompt, width, height, length, ref_image_size, server_url,
                ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None,
-               trigger=None):
+               trigger=None, latent=None):
         ensure_upstream(server_url)
         job_id = uuid.uuid4().hex
         _, jobs_dir = _encode_mailbox_paths()
@@ -731,7 +736,7 @@ class RemoteEncodeSubmit:
 
         threading.Thread(target=_work, daemon=True).start()
         print(f"[h3-client] encode mailbox submit {job_id}", flush=True)
-        return (1,)
+        return (latent if latent is not None else trigger,)
 
 
 def _mailbox_wait(load_fn, kind, timeout=7200):
