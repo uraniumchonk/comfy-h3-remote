@@ -1,4 +1,7 @@
-# MiniMax H3 Remote — denoise / decode / encode client nodes
+# Remote Pipe — 跨機 encode / denoise / decode + 跨圖信箱
+#
+# 10 號機只跑圖；160 跑 CLIP encode、DiT denoise、VAE decode。
+# 節點分類：Remote Pipe
 
 from .remote_sampler import (
     RemoteDenoiseSampler,
@@ -27,14 +30,14 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RemoteDenoiseSampler": "Remote Denoise Sampler (H3)",
-    "RemoteDenoiseNode": "Remote Denoise Node (H3)",
-    "RemoteDecodeNode": "Remote Decode Node (H3)",
-    "RemoteDecodeSubmit": "Remote Decode Submit (H3)",
-    "RemoteDecodeCollect": "Remote Decode Collect (H3)",
-    "RemoteDecodeGet": "Remote Decode Collect (H3)",
-    "RemoteEncodeNode": "Remote Encode Node (H3)",
-    "RemoteEncodeSubmit": "Remote Encode Submit (H3)",
-    "RemoteEncodeCollect": "Remote Encode Collect (H3)",
-    "H3LoraStack": "H3 LoRA Stack",
+    "RemoteDenoiseSampler": "Pipe Denoise Sampler",
+    "RemoteDenoiseNode": "Pipe Denoise",
+    "RemoteDecodeNode": "Pipe Decode (sync)",
+    "RemoteDecodeSubmit": "Pipe Decode Submit",
+    "RemoteDecodeCollect": "Pipe Decode Collect",
+    "RemoteDecodeGet": "Pipe Decode Collect",
+    "RemoteEncodeNode": "Pipe Encode (sync)",
+    "RemoteEncodeSubmit": "Pipe Encode Submit",
+    "RemoteEncodeCollect": "Pipe Encode Collect",
+    "H3LoraStack": "Pipe LoRA Stack",
 }
