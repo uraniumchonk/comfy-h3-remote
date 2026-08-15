@@ -405,16 +405,9 @@ class RemoteDecodeCollect:
         return float("NaN")
 
     def collect(self, stamp):
-        with _MAILBOX_LOCK:
-            data = _mailbox_load()
-            job = None
-            for j in data["jobs"]:
-                if j.get("status") == "ready":
-                    job = j
-                    break
-
+        job = _mailbox_wait(_mailbox_load, "decode")
         if job is None:
-            print("[h3-client] mailbox empty, skip collect", flush=True)
+            print("[h3-client] decode mailbox empty, skip collect", flush=True)
             return (torch.zeros(1, 8, 8, 3),)
 
         path = job.get("frames_path")
@@ -645,8 +638,35 @@ class RemoteEncodeSubmit:
         return (1,)
 
 
+def _mailbox_wait(load_fn, kind, timeout=7200):
+    """ready 就回傳；有 running 就堵住等；真的沒上一輪才回 None。"""
+    import comfy.model_management as mm
+
+    t0 = time.time()
+    while True:
+        with _MAILBOX_LOCK:
+            data = load_fn()
+            jobs = data.get("jobs") or []
+            ready = next((j for j in jobs if j.get("status") == "ready"), None)
+            running = any(j.get("status") == "running" for j in jobs)
+            failed = next((j for j in jobs if j.get("status") == "error"), None)
+        if ready is not None:
+            return ready
+        if failed is not None and not running:
+            raise RuntimeError(f"{kind} mailbox error: {failed.get('error')}")
+        if not running:
+            return None
+        if time.time() - t0 > timeout:
+            raise RuntimeError(f"{kind} mailbox wait timeout ({timeout}s)")
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        print(f"[h3-client] {kind} mailbox running, waiting {time.time()-t0:.0f}s",
+              flush=True)
+        time.sleep(0.4)
+
+
 class RemoteEncodeCollect:
-    """跨圖信箱：拿上一輪已經 ready 的 encode（positive + latent）。"""
+    """跨圖信箱：拿上一輪 encode。還在跑就等；信箱真的空才報錯。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -662,16 +682,10 @@ class RemoteEncodeCollect:
         return float("NaN")
 
     def collect(self):
-        with _MAILBOX_LOCK:
-            data = _encode_box_load()
-            job = None
-            for j in data["jobs"]:
-                if j.get("status") == "ready":
-                    job = j
-                    break
+        job = _mailbox_wait(_encode_box_load, "encode")
         if job is None:
             raise RuntimeError(
-                "encode mailbox empty。第一輪正常：EncodeSubmit 已送出，再 Queue 一次即可。"
+                "encode mailbox 沒有上一輪。先跑 h3_async_prefill.json 再 Queue 這張。"
             )
         path = job.get("result_path")
         if not path or not os.path.isfile(path):
