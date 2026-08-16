@@ -719,7 +719,7 @@ class RemoteEncodeSubmit:
 
 
 class RemoteEncodeCollect:
-    """拿目前跑完的那一包 encode（上一輪 Submit）。還在跑就堵；空就 pass（False）。"""
+    """拿目前跑完的那一包 encode（上一輪 Submit）。還在跑就堵；空立刻報錯。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -737,8 +737,7 @@ class RemoteEncodeCollect:
     def collect(self):
         slot = _box_wait("encode", "ready")
         if slot is None:
-            print("[h3-client] encode mailbox empty, skip collect", flush=True)
-            return (False, False)
+            raise RuntimeError("encode mailbox empty")
         packed = _box_take("encode")
         result = _deserialize(packed)
         print("[h3-client] encode mailbox collect", flush=True)
