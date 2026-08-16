@@ -342,7 +342,7 @@ def _prefetch(server_url, tag):
     try:
         raw = _backend_take(server_url, tag=tag, empty="error", start=False)
         _pulled_put(tag, raw)
-        print(f"[h3-client] {tag} prefetch ready {len(raw)/1e6:.1f}MB", flush=True)
+        print(f"[h3-client] {tag} ready", flush=True)
     except Exception as e:
         _pulled_put(tag, e)
         print(f"[h3-client] {tag} prefetch error: {e}", flush=True)
@@ -396,7 +396,6 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
     if box["err"] is not None:
         _pulled_put(tag, box["err"])
         raise box["err"]
-    print(f"[h3-client] {tag}: backend hold {time.time()-t0:.1f}s", flush=True)
     threading.Thread(target=_prefetch, args=(server_url, tag), daemon=True).start()
 
 
@@ -418,7 +417,6 @@ def _backend_take(server_url, timeout=7200, tag="", empty="error", start=False):
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=min(timeout, 600)) as resp:
                 raw = resp.read()
-            print(f"[h3-client] {tag} take {len(raw)/1e6:.1f}MB", flush=True)
             return raw
         except urllib.error.HTTPError as e:
             last = e
