@@ -187,7 +187,7 @@ def send_denoise_request(data, server_url=DEFAULT_SERVER, timeout=7200):
 
 # llama-swap /upstream/<id>：第一次請求會拉起服務。ttl=0 時 DiT 不會自己卸，
 # ensure_upstream 在目標沒起來時先 unload 再等到 /health。
-DEFAULT_DECODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-vae-decode"
+DEFAULT_DECODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-vae-decode-1"
 
 _ASYNC_SWAP = (
     "minimax-h3-vae-decode-1",
@@ -253,7 +253,22 @@ def ensure_upstream(server_url, timeout=300):
     raise RuntimeError(f"upstream not ready: {health}")
 
 
-def _backend_slot(server_url, timeout=8):
+def _upstream_loaded(server_url):
+    base, target = _upstream_id(server_url)
+    if not target:
+        return True
+    try:
+        with urllib.request.urlopen(base + "/running", timeout=3) as r:
+            data = json.loads(r.read().decode())
+        names = [m.get("model", "") for m in data.get("running", [])]
+        return target in names
+    except Exception:
+        return False
+
+
+def _backend_slot(server_url, timeout=8, start=False):
+    if not start and not _upstream_loaded(server_url):
+        return "idle"
     health = server_url.rstrip("/") + "/health"
     with urllib.request.urlopen(health, timeout=timeout) as r:
         info = json.loads(r.read().decode())
@@ -282,12 +297,63 @@ def _urlopen_slot(req, timeout, tag):
         time.sleep(0.5)
 
 
+_PULLED = {}
+_PULLED_LOCK = threading.Lock()
+_PULLED_EVT = {}
+
+
+def _pulled_reset(tag):
+    with _PULLED_LOCK:
+        _PULLED.pop(tag, None)
+        ev = threading.Event()
+        _PULLED_EVT[tag] = ev
+        return ev
+
+
+def _pulled_put(tag, value):
+    with _PULLED_LOCK:
+        _PULLED[tag] = value
+        ev = _PULLED_EVT.get(tag)
+    if ev is not None:
+        ev.set()
+
+
+def _pulled_pop(tag):
+    with _PULLED_LOCK:
+        return _PULLED.pop(tag, None)
+
+
+def _pulled_wait(tag, timeout=7200):
+    import comfy.model_management as mm
+
+    ev = _PULLED_EVT.get(tag)
+    t0 = time.time()
+    while ev is None or not ev.is_set():
+        if time.time() - t0 > timeout:
+            raise RuntimeError(f"{tag} prefetch timeout")
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        time.sleep(0.2)
+        ev = _PULLED_EVT.get(tag)
+    return _pulled_pop(tag)
+
+
+def _prefetch(server_url, tag):
+    try:
+        raw = _backend_take(server_url, tag=tag, empty="error", start=False)
+        _pulled_put(tag, raw)
+        print(f"[h3-client] {tag} prefetch ready {len(raw)/1e6:.1f}MB", flush=True)
+    except Exception as e:
+        _pulled_put(tag, e)
+        print(f"[h3-client] {tag} prefetch error: {e}", flush=True)
+
+
 def _backend_kick(server_url, path, data, timeout=7200, tag=""):
-    """POST work to backend. Server holds the result. Does not pop."""
+    """POST work to backend. Server holds the result. Prefetch pops in background."""
     import comfy.model_management as mm
 
     ensure_upstream(server_url)
-    slot = _backend_slot(server_url)
+    slot = _backend_slot(server_url, start=True)
     t0 = time.time()
     while slot == "running":
         if time.time() - t0 > timeout:
@@ -297,9 +363,11 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
         print(f"[h3-client] {tag} backend running, wait kick {time.time()-t0:.0f}s",
               flush=True)
         time.sleep(0.5)
-        slot = _backend_slot(server_url)
+        slot = _backend_slot(server_url, start=True)
+    _pulled_reset(tag)
     if slot == "hold":
-        print(f"[h3-client] {tag} backend already hold, skip submit", flush=True)
+        print(f"[h3-client] {tag} backend already hold, prefetch", flush=True)
+        threading.Thread(target=_prefetch, args=(server_url, tag), daemon=True).start()
         return
     payload = dump_bytes(data)
     req = urllib.request.Request(
@@ -311,12 +379,14 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
     print(f"[h3-client] {tag}: sending {len(payload)/1e6:.1f}MB to {server_url}...",
           flush=True)
     box = {"err": None}
+
     def _post():
         try:
             with _urlopen_slot(req, timeout, tag) as resp:
                 resp.read()
         except Exception as e:
             box["err"] = e
+
     th = threading.Thread(target=_post, daemon=True)
     th.start()
     while th.is_alive():
@@ -324,15 +394,22 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
             mm.throw_exception_if_processing_interrupted()
         th.join(0.5)
     if box["err"] is not None:
+        _pulled_put(tag, box["err"])
         raise box["err"]
     print(f"[h3-client] {tag}: backend hold {time.time()-t0:.1f}s", flush=True)
+    threading.Thread(target=_prefetch, args=(server_url, tag), daemon=True).start()
 
 
-def _backend_take(server_url, timeout=7200, tag="", empty="error"):
+def _backend_take(server_url, timeout=7200, tag="", empty="error", start=False):
     """Pop the held result from backend. empty='error'|'none'."""
     import comfy.model_management as mm
 
-    ensure_upstream(server_url)
+    if start:
+        ensure_upstream(server_url)
+    elif not _upstream_loaded(server_url):
+        if empty == "none":
+            return None
+        raise RuntimeError(f"{tag} mailbox empty")
     url = server_url.rstrip("/") + "/result"
     t0 = time.time()
     last = None
@@ -362,7 +439,11 @@ def _backend_take(server_url, timeout=7200, tag="", empty="error"):
 
 def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
     _backend_kick(server_url, "/decode", data, timeout=timeout, tag="decode")
-    raw = _backend_take(server_url, timeout=timeout, tag="decode", empty="error")
+    raw = _pulled_wait("decode", timeout=timeout)
+    if isinstance(raw, Exception):
+        raise raw
+    if raw is None:
+        raise RuntimeError("decode mailbox empty")
     return load_bytes(raw)
 
 
@@ -491,16 +572,12 @@ class RemoteDecodeCollect:
         return float("NaN")
 
     def collect(self, trigger, server_url=DEFAULT_DECODE_SERVER):
-        try:
-            slot = _backend_slot(server_url)
-        except Exception:
-            slot = "idle"
-        if slot != "hold":
-            print(f"[h3-client] decode slot={slot}, skip collect", flush=True)
-            return (torch.zeros(1, 8, 8, 3), False)
-        raw = _backend_take(server_url, tag="decode", empty="none")
+        raw = _pulled_pop("decode")
         if raw is None:
-            print("[h3-client] decode empty, skip collect", flush=True)
+            print("[h3-client] decode not ready, skip collect", flush=True)
+            return (torch.zeros(1, 8, 8, 3), False)
+        if isinstance(raw, Exception):
+            print(f"[h3-client] decode prefetch error, skip: {raw}", flush=True)
             return (torch.zeros(1, 8, 8, 3), False)
         packed = load_bytes(raw)
         if isinstance(packed, dict) and "frames" in packed:
@@ -523,7 +600,11 @@ DEFAULT_ENCODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-clip-enco
 
 def send_encode_request(data, server_url=DEFAULT_ENCODE_SERVER, timeout=7200):
     _backend_kick(server_url, "/encode", data, timeout=timeout, tag="encode")
-    raw = _backend_take(server_url, timeout=timeout, tag="encode", empty="error")
+    raw = _pulled_wait("encode", timeout=timeout)
+    if isinstance(raw, Exception):
+        raise raw
+    if raw is None:
+        raise RuntimeError("encode mailbox empty")
     return load_bytes(raw)
 
 
@@ -663,7 +744,18 @@ class RemoteEncodeCollect:
         return float("NaN")
 
     def collect(self, server_url=DEFAULT_ENCODE_SERVER):
-        raw = _backend_take(server_url, tag="encode", empty="error")
+        raw = _pulled_pop("encode")
+        if raw is None:
+            ev = _PULLED_EVT.get("encode")
+            if ev is not None and not ev.is_set():
+                raw = _pulled_wait("encode")
+            else:
+                raw = _backend_take(server_url, tag="encode", empty="error",
+                                    start=False)
+        if isinstance(raw, Exception):
+            raise raw
+        if raw is None:
+            raise RuntimeError("encode mailbox empty")
         result = load_bytes(raw)
         print("[h3-client] encode collect", flush=True)
         return (result["positive"], result["latent"])
