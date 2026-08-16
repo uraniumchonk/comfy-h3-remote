@@ -53,7 +53,7 @@ Prefill 若是墊檔，第一支廢片刪掉即可。
 | Node | Do / 做什麼 |
 |---|---|
 | Encode Submit | Fire-and-forget CLIP. `trigger` after denoise so it does not fight DiT. |
-| Encode Collect | Wait if mailbox still running. Error only if truly empty. |
+| Encode Collect | Wait if mailbox still running. Empty returns False/False (same Switch pattern as decode audio). |
 | Decode Submit | Send AV latent. `trigger` out is the same latent (passthrough). Blocks if the single slot is still occupied. |
 | Decode Collect | Wait if still running (always the previous Submit). `audio` is `False` when empty. Grab at round start. |
 
