@@ -301,8 +301,8 @@ def _box_set(kind, **fields):
 
 
 def _box_wait(kind, want, timeout=7200):
-    """want='ready': block while running, return slot or None if idle.
-    want='idle': block while running/ready (error is replaceable)."""
+    """want='ready': .pt 就是 hold。running 且還沒寫好就等。idle 且沒檔才算空。
+    want='idle': running / ready / 已有 .pt 都算占用。"""
     import comfy.model_management as mm
 
     t0 = time.time()
@@ -310,21 +310,25 @@ def _box_wait(kind, want, timeout=7200):
         with _MAILBOX_LOCK:
             data = _box_load(kind)
             status = data.get("status") or "idle"
+            _, pt = _box_paths(kind)
+            has_pt = os.path.isfile(pt)
         if want == "ready":
-            if status == "ready":
+            if has_pt:
                 return data
             if status == "error":
                 raise RuntimeError(f"{kind} mailbox error: {data.get('error')}")
             if status != "running":
                 return None
         elif want == "idle":
-            if status == "error" or status not in ("running", "ready"):
+            if status == "error" and not has_pt:
+                return data
+            if status not in ("running", "ready") and not has_pt:
                 return data
         if time.time() - t0 > timeout:
             raise RuntimeError(f"{kind} mailbox wait {want} timeout ({timeout}s)")
         if mm.processing_interrupted():
             mm.throw_exception_if_processing_interrupted()
-        print(f"[h3-client] {kind} mailbox {status}, waiting {want} "
+        print(f"[h3-client] {kind} mailbox {status} pt={int(has_pt)}, waiting {want} "
               f"{time.time()-t0:.0f}s", flush=True)
         time.sleep(0.4)
 
