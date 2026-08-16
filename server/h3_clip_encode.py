@@ -41,7 +41,7 @@ from comfy_extras.nodes_minimax_h3 import (  # noqa: E402
 import node_helpers  # noqa: E402
 
 from fastapi import FastAPI, Request  # noqa: E402
-from fastapi.responses import Response  # noqa: E402
+from fastapi.responses import JSONResponse, Response  # noqa: E402
 
 
 def _serialize(obj):
@@ -257,45 +257,53 @@ def run_encode(data):
         _free_gpu("after-clip")
 
 
-class _HoldResponse(Response):
-    """Keep the slot until the client finishes taking the completed payload."""
-
-    def __init__(self, content, media_type, release):
-        super().__init__(content=content, media_type=media_type)
-        self._release = release
-
-    async def __call__(self, scope, receive, send):
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            self._release()
-
-
 app = FastAPI(title="MiniMax H3 Remote Encode")
 _POOL = ThreadPoolExecutor(max_workers=1)
 _SLOT = "idle"
+_HELD = None
 _SLOT_LOCK = threading.Lock()
 
 
-def _slot_try():
-    global _SLOT
+def _slot_try_run():
+    global _SLOT, _HELD
     with _SLOT_LOCK:
         if _SLOT != "idle":
             return False
-        _SLOT = "busy"
+        _SLOT = "running"
+        _HELD = None
         return True
 
 
-def _slot_free():
-    global _SLOT
+def _slot_set_hold(payload):
+    global _SLOT, _HELD
     with _SLOT_LOCK:
+        _HELD = payload
+        _SLOT = "hold"
+
+
+def _slot_pop():
+    global _SLOT, _HELD
+    with _SLOT_LOCK:
+        if _SLOT != "hold" or _HELD is None:
+            return None
+        data = _HELD
+        _HELD = None
+        _SLOT = "idle"
+        return data
+
+
+def _slot_fail():
+    global _SLOT, _HELD
+    with _SLOT_LOCK:
+        _HELD = None
         _SLOT = "idle"
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "clip": CLIP is not None, "video_vae": VIDEO_VAE is not None,
-            "slot": _SLOT, "queue": 0 if _SLOT == "idle" else 1}
+            "slot": _SLOT, "queue": 0 if _SLOT == "idle" else 1,
+            "held": 0 if _HELD is None else len(_HELD)}
 
 
 @app.get("/progress")
@@ -303,11 +311,22 @@ def progress():
     return dict(PROGRESS)
 
 
+@app.get("/result")
+def result_endpoint():
+    if _SLOT == "running":
+        return Response(content=b"running", status_code=409)
+    payload = _slot_pop()
+    if payload is None:
+        return Response(content=b"empty", status_code=404)
+    print(f"[h3-encode] result popped {len(payload)/1e6:.1f}MB", flush=True)
+    return Response(content=payload, media_type="application/octet-stream")
+
+
 @app.post("/encode")
 async def encode_endpoint(request: Request):
     import traceback
-    if not _slot_try():
-        print("[h3-encode] slot busy, reject", flush=True)
+    if not _slot_try_run():
+        print(f"[h3-encode] slot {_SLOT}, reject", flush=True)
         return Response(content=b"busy", status_code=409)
     try:
         body = await request.body()
@@ -316,10 +335,11 @@ async def encode_endpoint(request: Request):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(_POOL, run_encode, data)
         payload = dump_bytes(result)
+        _slot_set_hold(payload)
         print(f"[h3-encode] packed {len(payload)/1e6:.1f}MB hold", flush=True)
-        return _HoldResponse(payload, "application/octet-stream", _slot_free)
+        return JSONResponse({"status": "hold", "bytes": len(payload)})
     except Exception:
-        _slot_free()
+        _slot_fail()
         tb = traceback.format_exc()
         print(tb, flush=True)
         return Response(content=tb.encode(), status_code=500, media_type="text/plain")
