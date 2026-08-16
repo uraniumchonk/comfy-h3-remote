@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import gc
 import io
-import itertools
 import multiprocessing as mp
 import os
 import sys
@@ -19,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 
@@ -337,31 +336,46 @@ def run_decode(samples, world=1):
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import Response  # noqa: E402
 
+class _HoldResponse(Response):
+    """Keep the slot until the client finishes taking the completed payload."""
+
+    def __init__(self, content, media_type, release):
+        super().__init__(content=content, media_type=media_type)
+        self._release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
+
+
 app = FastAPI(title="MiniMax H3 Remote AV Decode")
 _POOL = ThreadPoolExecutor(max_workers=1)
-_QDEPTH = 0
-_QLOCK = threading.Lock()
-_QID = itertools.count(1)
+_SLOT = "idle"
+_SLOT_LOCK = threading.Lock()
 
 
-def _run_queued(fn, *args):
-    global _QDEPTH
-    with _QLOCK:
-        _QDEPTH += 1
-        jid = next(_QID)
-        waiting = _QDEPTH - 1
-    print(f"[h3-decode] queue count={jid} waiting={waiting}", flush=True)
-    try:
-        return fn(*args)
-    finally:
-        with _QLOCK:
-            _QDEPTH -= 1
+def _slot_try():
+    global _SLOT
+    with _SLOT_LOCK:
+        if _SLOT != "idle":
+            return False
+        _SLOT = "busy"
+        return True
+
+
+def _slot_free():
+    global _SLOT
+    with _SLOT_LOCK:
+        _SLOT = "idle"
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "video_vae": VIDEO_VAE is not None,
-            "audio_vae": AUDIO_VAE is not None, "dp": _WORLD, "queue": _QDEPTH}
+            "audio_vae": AUDIO_VAE is not None, "dp": _WORLD,
+            "slot": _SLOT, "queue": 0 if _SLOT == "idle" else 1}
 
 
 @app.get("/progress")
@@ -372,17 +386,21 @@ def progress():
 @app.post("/decode")
 async def decode_endpoint(request: Request):
     import traceback
+    if not _slot_try():
+        print("[h3-decode] slot busy, reject", flush=True)
+        return Response(content=b"busy", status_code=409)
     try:
         body = await request.body()
         print(f"[h3-decode] /decode {len(body)/1e6:.1f}MB", flush=True)
         data = load_bytes(body)
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
-            _POOL, _run_queued, run_decode, data.get("samples"), _WORLD)
+            _POOL, run_decode, data.get("samples"), _WORLD)
         payload = dump_bytes(result)
-        print(f"[h3-decode] packed {len(payload)/1e6:.1f}MB wait client", flush=True)
-        return Response(content=payload, media_type="application/octet-stream")
+        print(f"[h3-decode] packed {len(payload)/1e6:.1f}MB hold", flush=True)
+        return _HoldResponse(payload, "application/octet-stream", _slot_free)
     except Exception:
+        _slot_free()
         tb = traceback.format_exc()
         print(tb, flush=True)
         return Response(content=tb.encode(), status_code=500, media_type="text/plain")

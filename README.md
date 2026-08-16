@@ -108,7 +108,7 @@ python server/h3_vae_decode.py \
   --dp 1 --host 127.0.0.1 --port 8300
 ```
 
-Calls wait for `/health` before the real POST. Same service is FIFO. Kitchen RoPE only sees `cuda:0`; multi-GPU decode needs one process per card and `CUDA_VISIBLE_DEVICES` remap.
+Calls wait for `/health` before the real POST. Encode/decode hold one slot; a second POST gets 409 until the client finishes taking the completed payload. Kitchen RoPE only sees `cuda:0`; multi-GPU decode needs one process per card and `CUDA_VISIBLE_DEVICES` remap.
 
 llama-swap snippet: `examples/llama-swap.yaml` (`h3-async`: encode on GPU 1, decode-1 on GPU 0).
 
