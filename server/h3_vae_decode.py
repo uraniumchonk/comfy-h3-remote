@@ -340,24 +340,48 @@ app = FastAPI(title="MiniMax H3 Remote AV Decode")
 _POOL = ThreadPoolExecutor(max_workers=1)
 _SLOT = "idle"
 _HELD = None
+_PENDING = None
 _SLOT_LOCK = threading.Lock()
 
 
-def _slot_try_run():
+class _Job:
+    def __init__(self, data):
+        self.data = data
+        self.done = threading.Event()
+        self.payload = None
+        self.error = None
+
+
+def _run_job(job):
     global _SLOT, _HELD
+    try:
+        result = run_decode(job.data.get("samples") if isinstance(job.data, dict) else job.data, _WORLD)
+        payload = dump_bytes(result)
+        with _SLOT_LOCK:
+            _HELD = payload
+            _SLOT = "hold"
+        job.payload = payload
+        print(f"[h3-decode] packed {len(payload)/1e6:.1f}MB hold", flush=True)
+    except Exception as e:
+        with _SLOT_LOCK:
+            _HELD = None
+            _SLOT = "idle"
+        job.error = e
+        print(f"[h3-decode] job error: {e}", flush=True)
+        _kick_pending()
+    finally:
+        job.done.set()
+
+
+def _kick_pending():
+    global _SLOT, _PENDING
     with _SLOT_LOCK:
-        if _SLOT != "idle":
-            return False
+        if _SLOT != "idle" or _PENDING is None:
+            return
+        job = _PENDING
+        _PENDING = None
         _SLOT = "running"
-        _HELD = None
-        return True
-
-
-def _slot_set_hold(payload):
-    global _SLOT, _HELD
-    with _SLOT_LOCK:
-        _HELD = payload
-        _SLOT = "hold"
+    _POOL.submit(_run_job, job)
 
 
 def _slot_pop():
@@ -368,21 +392,34 @@ def _slot_pop():
         data = _HELD
         _HELD = None
         _SLOT = "idle"
-        return data
+    _kick_pending()
+    return data
 
 
-def _slot_fail():
-    global _SLOT, _HELD
+def _accept_job(data):
+    global _SLOT, _PENDING
+    job = _Job(data)
     with _SLOT_LOCK:
-        _HELD = None
-        _SLOT = "idle"
+        if _SLOT == "idle":
+            _SLOT = "running"
+            start = True
+        elif _PENDING is None:
+            _PENDING = job
+            start = False
+            print("[h3-decode] queued 1", flush=True)
+        else:
+            return None
+    if start:
+        _POOL.submit(_run_job, job)
+    return job
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "video_vae": VIDEO_VAE is not None,
             "audio_vae": AUDIO_VAE is not None, "dp": _WORLD,
-            "slot": _SLOT, "queue": 0 if _SLOT == "idle" else 1,
+            "slot": _SLOT, "queue": 0 if _SLOT == "idle" and _PENDING is None else 1,
+            "pending": _PENDING is not None,
             "held": 0 if _HELD is None else len(_HELD)}
 
 
@@ -393,7 +430,7 @@ def progress():
 
 @app.get("/result")
 def result_endpoint():
-    if _SLOT == "running":
+    if _SLOT == "running" and _HELD is None:
         return Response(content=b"running", status_code=409)
     payload = _slot_pop()
     if payload is None:
@@ -405,22 +442,20 @@ def result_endpoint():
 @app.post("/decode")
 async def decode_endpoint(request: Request):
     import traceback
-    if not _slot_try_run():
-        print(f"[h3-decode] slot {_SLOT}, reject", flush=True)
-        return Response(content=b"busy", status_code=409)
     try:
         body = await request.body()
         print(f"[h3-decode] /decode {len(body)/1e6:.1f}MB", flush=True)
         data = load_bytes(body)
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            _POOL, run_decode, data.get("samples"), _WORLD)
-        payload = dump_bytes(result)
-        _slot_set_hold(payload)
-        print(f"[h3-decode] packed {len(payload)/1e6:.1f}MB hold", flush=True)
-        return JSONResponse({"status": "hold", "bytes": len(payload)})
+        job = _accept_job(data)
+        if job is None:
+            print("[h3-decode] queue full, reject", flush=True)
+            return Response(content=b"busy", status_code=409)
+        await loop.run_in_executor(None, job.done.wait)
+        if job.error is not None:
+            raise job.error
+        return JSONResponse({"status": "hold", "bytes": len(job.payload)})
     except Exception:
-        _slot_fail()
         tb = traceback.format_exc()
         print(tb, flush=True)
         return Response(content=tb.encode(), status_code=500, media_type="text/plain")
