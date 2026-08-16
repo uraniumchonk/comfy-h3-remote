@@ -292,8 +292,6 @@ def _urlopen_slot(req, timeout, tag):
             raise RuntimeError(f"{tag} backend slot timeout") from last
         if mm.processing_interrupted():
             mm.throw_exception_if_processing_interrupted()
-        print(f"[h3-client] {tag} backend busy, waiting {time.time()-t0:.0f}s",
-              flush=True)
         time.sleep(0.5)
 
 
@@ -378,21 +376,9 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
     ensure_upstream(server_url)
     _wait_collected(tag, timeout=timeout)
     slot = _backend_slot(server_url, start=True)
-    t0 = time.time()
-    while slot == "running":
-        if time.time() - t0 > timeout:
-            raise RuntimeError(f"{tag} backend still running")
-        if mm.processing_interrupted():
-            mm.throw_exception_if_processing_interrupted()
-        print(f"[h3-client] {tag} backend running, wait kick {time.time()-t0:.0f}s",
-              flush=True)
-        time.sleep(0.5)
-        slot = _backend_slot(server_url, start=True)
-    if slot == "hold":
-        print(f"[h3-client] {tag} backend already hold, prefetch", flush=True)
+    if slot == "hold" and not _pulled_has(tag) and not _pulled_inflight(tag):
         _pulled_reset(tag)
         threading.Thread(target=_prefetch, args=(server_url, tag), daemon=True).start()
-        return
     payload = dump_bytes(data)
     req = urllib.request.Request(
         server_url.rstrip("/") + path,
@@ -400,8 +386,7 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
         headers={"Content-Type": "application/octet-stream"},
         method="POST",
     )
-    print(f"[h3-client] {tag}: sending {len(payload)/1e6:.1f}MB to {server_url}...",
-          flush=True)
+    print(f"[h3-client] {tag} send {len(payload)/1e6:.1f}MB", flush=True)
     box = {"err": None}
 
     def _post():
@@ -455,8 +440,6 @@ def _backend_take(server_url, timeout=7200, tag="", empty="error", start=False):
             raise RuntimeError(f"{tag} backend take timeout") from last
         if mm.processing_interrupted():
             mm.throw_exception_if_processing_interrupted()
-        print(f"[h3-client] {tag} backend running, waiting take {time.time()-t0:.0f}s",
-              flush=True)
         time.sleep(0.4)
 
 
@@ -564,7 +547,6 @@ class RemoteDecodeSubmit:
                 print(f"[h3-client] decode kick error: {e}", flush=True)
 
         threading.Thread(target=_work, daemon=True).start()
-        print("[h3-client] decode submit", flush=True)
         return (samples,)
 
 
@@ -605,10 +587,8 @@ class RemoteDecodeCollect:
                 raw = _backend_take(server_url, tag="decode", empty="none",
                                     start=False)
             else:
-                print("[h3-client] decode not ready, skip collect", flush=True)
                 return (torch.zeros(1, 8, 8, 3), False)
         if isinstance(raw, Exception) or raw is None:
-            print("[h3-client] decode not ready, skip collect", flush=True)
             return (torch.zeros(1, 8, 8, 3), False)
         packed = load_bytes(raw)
         if isinstance(packed, dict) and "frames" in packed:
@@ -616,8 +596,6 @@ class RemoteDecodeCollect:
         else:
             frames, audio = packed, False
         audio = _audio_or_false(audio)
-        print(f"[h3-client] decode collect {list(frames.shape)} "
-              f"audio={'ok' if audio is not False else 'false'}", flush=True)
         return (frames, audio)
 
 
@@ -746,7 +724,6 @@ class RemoteEncodeSubmit:
                 print(f"[h3-client] encode kick error: {e}", flush=True)
 
         threading.Thread(target=_work, daemon=True).start()
-        print("[h3-client] encode submit", flush=True)
         return (latent if latent is not None else trigger,)
 
 
@@ -787,7 +764,6 @@ class RemoteEncodeCollect:
         if raw is None:
             raise RuntimeError("encode mailbox empty")
         result = load_bytes(raw)
-        print("[h3-client] encode collect", flush=True)
         return (result["positive"], result["latent"])
 
 
