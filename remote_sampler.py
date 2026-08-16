@@ -302,6 +302,29 @@ _PULLED_LOCK = threading.Lock()
 _PULLED_EVT = {}
 
 
+def _pulled_has(tag):
+    with _PULLED_LOCK:
+        return tag in _PULLED
+
+
+def _pulled_inflight(tag):
+    ev = _PULLED_EVT.get(tag)
+    return ev is not None and not ev.is_set()
+
+
+def _wait_collected(tag, timeout=7200):
+    """Don't start a new submit while the previous hold is still uncollected."""
+    import comfy.model_management as mm
+
+    t0 = time.time()
+    while _pulled_has(tag) or _pulled_inflight(tag):
+        if time.time() - t0 > timeout:
+            raise RuntimeError(f"{tag} previous hold not collected")
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        time.sleep(0.4)
+
+
 def _pulled_reset(tag):
     with _PULLED_LOCK:
         _PULLED.pop(tag, None)
@@ -353,6 +376,7 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
     import comfy.model_management as mm
 
     ensure_upstream(server_url)
+    _wait_collected(tag, timeout=timeout)
     slot = _backend_slot(server_url, start=True)
     t0 = time.time()
     while slot == "running":
@@ -570,12 +594,26 @@ class RemoteDecodeCollect:
         return float("NaN")
 
     def collect(self, trigger, server_url=DEFAULT_DECODE_SERVER):
-        raw = _pulled_pop("decode")
+        if _pulled_inflight("decode"):
+            raw = _pulled_wait("decode")
+        else:
+            raw = _pulled_pop("decode")
         if raw is None:
-            print("[h3-client] decode not ready, skip collect", flush=True)
-            return (torch.zeros(1, 8, 8, 3), False)
+            try:
+                slot = _backend_slot(server_url, start=False)
+            except Exception:
+                slot = "idle"
+            if slot == "hold":
+                raw = _backend_take(server_url, tag="decode", empty="none",
+                                    start=False)
+            else:
+                print("[h3-client] decode not ready, skip collect", flush=True)
+                return (torch.zeros(1, 8, 8, 3), False)
         if isinstance(raw, Exception):
             print(f"[h3-client] decode prefetch error, skip: {raw}", flush=True)
+            return (torch.zeros(1, 8, 8, 3), False)
+        if raw is None:
+            print("[h3-client] decode not ready, skip collect", flush=True)
             return (torch.zeros(1, 8, 8, 3), False)
         packed = load_bytes(raw)
         if isinstance(packed, dict) and "frames" in packed:
