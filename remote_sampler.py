@@ -756,7 +756,7 @@ class RemoteEncodeSubmit:
 
 
 class RemoteEncodeCollect:
-    """拿目前跑完的那一包 encode。running 直接 pass；空立刻報錯。"""
+    """拿目前跑完的那一包 encode。running / prefetch 就堵；空立刻報錯。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -785,18 +785,8 @@ class RemoteEncodeCollect:
         else:
             raw = _pulled_pop("encode")
         if raw is None:
-            try:
-                slot = _backend_slot(server_url, start=False)
-            except Exception:
-                slot = "idle"
-            if slot == "hold":
-                raw = _backend_take(server_url, tag="encode", empty="error",
-                                    start=False)
-            elif slot == "running":
-                print("[h3-client] encode running, skip collect", flush=True)
-                return (False, False)
-            else:
-                raise RuntimeError("encode mailbox empty")
+            raw = _backend_take(server_url, tag="encode", empty="error",
+                                start=False)
         if isinstance(raw, Exception):
             raise raw
         if raw is None:
