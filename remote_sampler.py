@@ -388,9 +388,9 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
               flush=True)
         time.sleep(0.5)
         slot = _backend_slot(server_url, start=True)
-    _pulled_reset(tag)
     if slot == "hold":
         print(f"[h3-client] {tag} backend already hold, prefetch", flush=True)
+        _pulled_reset(tag)
         threading.Thread(target=_prefetch, args=(server_url, tag), daemon=True).start()
         return
     payload = dump_bytes(data)
@@ -420,6 +420,7 @@ def _backend_kick(server_url, path, data, timeout=7200, tag=""):
     if box["err"] is not None:
         _pulled_put(tag, box["err"])
         raise box["err"]
+    _pulled_reset(tag)
     threading.Thread(target=_prefetch, args=(server_url, tag), daemon=True).start()
 
 
@@ -594,10 +595,7 @@ class RemoteDecodeCollect:
         return float("NaN")
 
     def collect(self, trigger, server_url=DEFAULT_DECODE_SERVER):
-        if _pulled_inflight("decode"):
-            raw = _pulled_wait("decode")
-        else:
-            raw = _pulled_pop("decode")
+        raw = _pulled_pop("decode")
         if raw is None:
             try:
                 slot = _backend_slot(server_url, start=False)
@@ -609,10 +607,7 @@ class RemoteDecodeCollect:
             else:
                 print("[h3-client] decode not ready, skip collect", flush=True)
                 return (torch.zeros(1, 8, 8, 3), False)
-        if isinstance(raw, Exception):
-            print(f"[h3-client] decode prefetch error, skip: {raw}", flush=True)
-            return (torch.zeros(1, 8, 8, 3), False)
-        if raw is None:
+        if isinstance(raw, Exception) or raw is None:
             print("[h3-client] decode not ready, skip collect", flush=True)
             return (torch.zeros(1, 8, 8, 3), False)
         packed = load_bytes(raw)
