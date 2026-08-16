@@ -16,7 +16,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 
 import torch
 
@@ -255,32 +254,37 @@ def ensure_upstream(server_url, timeout=300):
     raise RuntimeError(f"upstream not ready: {health}")
 
 _MAILBOX_LOCK = threading.Lock()
+_BOX_DIR = "h3_mailbox"
 
 
-def _mailbox_paths():
+def _box_root():
     try:
         import folder_paths
-        root = folder_paths.get_output_directory()
+        root = os.path.join(folder_paths.get_output_directory(), _BOX_DIR)
     except Exception:
-        root = os.path.join(os.path.expanduser("~"), "h3_decode_mailbox")
-    jobs_dir = os.path.join(root, "h3_decode_jobs")
-    os.makedirs(jobs_dir, exist_ok=True)
-    return os.path.join(root, "h3_decode_mailbox.json"), jobs_dir
+        root = os.path.join(os.path.expanduser("~"), _BOX_DIR)
+    os.makedirs(root, exist_ok=True)
+    return root
 
 
-def _mailbox_load():
-    path, _ = _mailbox_paths()
+def _box_paths(kind):
+    root = _box_root()
+    return os.path.join(root, kind + ".json"), os.path.join(root, kind + ".pt")
+
+
+def _box_load(kind):
+    path, _ = _box_paths(kind)
     if not os.path.isfile(path):
-        return {"jobs": []}
+        return {"status": "idle", "error": None}
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    if not isinstance(data, dict) or "jobs" not in data:
-        return {"jobs": []}
+    if not isinstance(data, dict):
+        return {"status": "idle", "error": None}
     return data
 
 
-def _mailbox_save(data):
-    path, _ = _mailbox_paths()
+def _box_save(kind, data):
+    path, _ = _box_paths(kind)
     d = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -288,14 +292,55 @@ def _mailbox_save(data):
     os.replace(tmp, path)
 
 
-def _mailbox_update(job_id, **fields):
+def _box_set(kind, **fields):
     with _MAILBOX_LOCK:
-        data = _mailbox_load()
-        for job in data["jobs"]:
-            if job.get("id") == job_id:
-                job.update(fields)
-                break
-        _mailbox_save(data)
+        data = _box_load(kind)
+        data.update(fields)
+        _box_save(kind, data)
+        return data
+
+
+def _box_wait(kind, want, timeout=7200):
+    """want='ready': block while running, return slot or None if idle.
+    want='idle': block while running/ready (error is replaceable)."""
+    import comfy.model_management as mm
+
+    t0 = time.time()
+    while True:
+        with _MAILBOX_LOCK:
+            data = _box_load(kind)
+            status = data.get("status") or "idle"
+        if want == "ready":
+            if status == "ready":
+                return data
+            if status == "error":
+                raise RuntimeError(f"{kind} mailbox error: {data.get('error')}")
+            if status != "running":
+                return None
+        elif want == "idle":
+            if status == "error" or status not in ("running", "ready"):
+                return data
+        if time.time() - t0 > timeout:
+            raise RuntimeError(f"{kind} mailbox wait {want} timeout ({timeout}s)")
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        print(f"[h3-client] {kind} mailbox {status}, waiting {want} "
+              f"{time.time()-t0:.0f}s", flush=True)
+        time.sleep(0.4)
+
+
+def _box_take(kind):
+    _, pt = _box_paths(kind)
+    if not os.path.isfile(pt):
+        _box_set(kind, status="error", error="result missing")
+        raise RuntimeError(f"{kind} mailbox result missing: {pt}")
+    packed = torch.load(pt, weights_only=False)
+    try:
+        os.remove(pt)
+    except OSError:
+        pass
+    _box_set(kind, status="idle", error=None)
+    return packed
 
 
 def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
@@ -320,7 +365,7 @@ def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
 
     def _post():
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _urlopen_slot(req, timeout, "decode") as resp:
                 box["data"] = resp.read()
         except Exception as e:
             box["err"] = e
@@ -339,6 +384,28 @@ def send_decode_request(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
     print(f"[h3-client] decode: received {len(box['data'])/1e6:.1f}MB in {elapsed:.1f}s",
           flush=True)
     return load_bytes(box["data"])
+
+
+def _urlopen_slot(req, timeout, tag):
+    """POST that blocks on backend 409 (single slot busy) instead of failing."""
+    import comfy.model_management as mm
+
+    t0 = time.time()
+    last = None
+    while True:
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code != 409:
+                raise
+        if time.time() - t0 > timeout:
+            raise RuntimeError(f"{tag} backend slot timeout") from last
+        if mm.processing_interrupted():
+            mm.throw_exception_if_processing_interrupted()
+        print(f"[h3-client] {tag} backend busy, waiting {time.time()-t0:.0f}s",
+              flush=True)
+        time.sleep(0.5)
 
 
 async def send_decode_request_async(data, server_url=DEFAULT_DECODE_SERVER, timeout=7200):
@@ -428,44 +495,29 @@ class RemoteDecodeSubmit:
 
     def submit(self, samples, server_url):
         ensure_upstream(server_url)
-        job_id = uuid.uuid4().hex
-        _, jobs_dir = _mailbox_paths()
-        frames_path = os.path.join(jobs_dir, job_id + ".pt")
-        rec = {
-            "id": job_id,
-            "status": "running",
-            "server_url": server_url,
-            "frames_path": frames_path,
-            "error": None,
-            "created": time.time(),
-        }
-        with _MAILBOX_LOCK:
-            data = _mailbox_load()
-            data["jobs"].append(rec)
-            _mailbox_save(data)
+        _box_wait("decode", "idle")
+        _, pt = _box_paths("decode")
+        _box_set("decode", status="running", error=None, created=time.time())
 
         def _work():
             try:
                 result = send_decode_request({"samples": samples}, server_url)
                 if result.get("frames") is None:
                     raise RuntimeError("decode server returned no frames")
-                torch.save(_serialize(result), frames_path)
-                _mailbox_update(job_id, status="ready")
-                print(f"[h3-client] mailbox ready {job_id}", flush=True)
+                torch.save(_serialize(result), pt)
+                _box_set("decode", status="ready")
+                print("[h3-client] decode mailbox ready", flush=True)
             except Exception as e:
-                _mailbox_update(job_id, status="error", error=str(e))
-                print(f"[h3-client] mailbox error {job_id}: {e}", flush=True)
+                _box_set("decode", status="error", error=str(e))
+                print(f"[h3-client] decode mailbox error: {e}", flush=True)
 
         threading.Thread(target=_work, daemon=True).start()
-        print(f"[h3-client] mailbox submit {job_id}", flush=True)
+        print("[h3-client] decode mailbox submit", flush=True)
         return (samples,)
 
 
 class RemoteDecodeCollect:
-    """只 pop 已經 ready 的上一輪畫面。trigger 只決定執行順序，不是這一輪 latent。
-
-    不要等 running：Submit 跟 Collect 都掛在 denoise 後，等 running 會變成收這一輪。
-    """
+    """拿目前跑完的那一包（上一輪 Submit）。後端還在跑就堵住；空才吐 dummy。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -485,36 +537,19 @@ class RemoteDecodeCollect:
         return float("NaN")
 
     def collect(self, trigger):
-        with _MAILBOX_LOCK:
-            data = _mailbox_load()
-            job = next((j for j in data["jobs"] if j.get("status") == "ready"), None)
-
-        if job is None:
+        slot = _box_wait("decode", "ready")
+        if slot is None:
             print("[h3-client] decode mailbox empty, skip collect", flush=True)
             return (torch.zeros(1, 8, 8, 3), False)
 
-        path = job.get("frames_path")
-        if not path or not os.path.isfile(path):
-            _mailbox_update(job["id"], status="error", error="frames file missing")
-            raise RuntimeError(f"mailbox job {job['id']} frames missing: {path}")
-
-        packed = torch.load(path, weights_only=False)
-        with _MAILBOX_LOCK:
-            data = _mailbox_load()
-            data["jobs"] = [j for j in data["jobs"] if j.get("id") != job["id"]]
-            _mailbox_save(data)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
+        packed = _box_take("decode")
         if isinstance(packed, dict) and "frames" in packed:
             result = _deserialize(packed)
             frames, audio = _unpack_decode(result)
         else:
             frames, audio = packed, False
         audio = _audio_or_false(audio)
-        print(f"[h3-client] mailbox collect {job['id']} {list(frames.shape)} "
+        print(f"[h3-client] decode mailbox collect {list(frames.shape)} "
               f"audio={'ok' if audio is not False else 'false'}", flush=True)
         return (frames, audio)
 
@@ -525,49 +560,6 @@ class RemoteDecodeGet(RemoteDecodeCollect):
 
 
 DEFAULT_ENCODE_SERVER = "http://192.168.0.160:8090/upstream/minimax-h3-clip-encode"
-_ENCODE_MAILBOX = "h3_encode_mailbox.json"
-_ENCODE_JOBS_DIR = "h3_encode_jobs"
-
-
-def _encode_mailbox_paths():
-    try:
-        import folder_paths
-        root = folder_paths.get_output_directory()
-    except Exception:
-        root = os.path.join(os.path.expanduser("~"), "h3_encode_mailbox")
-    jobs_dir = os.path.join(root, _ENCODE_JOBS_DIR)
-    os.makedirs(jobs_dir, exist_ok=True)
-    return os.path.join(root, _ENCODE_MAILBOX), jobs_dir
-
-
-def _encode_box_load():
-    path, _ = _encode_mailbox_paths()
-    if not os.path.isfile(path):
-        return {"jobs": []}
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict) or "jobs" not in data:
-        return {"jobs": []}
-    return data
-
-
-def _encode_box_save(data):
-    path, _ = _encode_mailbox_paths()
-    d = os.path.dirname(path)
-    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def _encode_box_update(job_id, **fields):
-    with _MAILBOX_LOCK:
-        data = _encode_box_load()
-        for job in data["jobs"]:
-            if job.get("id") == job_id:
-                job.update(fields)
-                break
-        _encode_box_save(data)
 
 
 def send_encode_request(data, server_url=DEFAULT_ENCODE_SERVER, timeout=7200):
@@ -589,7 +581,7 @@ def send_encode_request(data, server_url=DEFAULT_ENCODE_SERVER, timeout=7200):
 
     def _post():
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _urlopen_slot(req, timeout, "encode") as resp:
                 box["data"] = resp.read()
         except Exception as e:
             box["err"] = e
@@ -704,22 +696,9 @@ class RemoteEncodeSubmit:
                ref_image=None, ref_video=None, ref_video_audio=None, ref_audio=None,
                trigger=None, latent=None):
         ensure_upstream(server_url)
-        job_id = uuid.uuid4().hex
-        _, jobs_dir = _encode_mailbox_paths()
-        payload_path = os.path.join(jobs_dir, job_id + ".pt")
-        rec = {
-            "id": job_id,
-            "status": "running",
-            "server_url": server_url,
-            "result_path": payload_path,
-            "error": None,
-            "created": time.time(),
-        }
-        with _MAILBOX_LOCK:
-            data = _encode_box_load()
-            data["jobs"].append(rec)
-            _encode_box_save(data)
-
+        _box_wait("encode", "idle")
+        _, pt = _box_paths("encode")
+        _box_set("encode", status="running", error=None, created=time.time())
         packed = _pack_encode_payload(
             prompt, width, height, length, ref_image_size,
             ref_image, ref_video, ref_video_audio, ref_audio)
@@ -727,48 +706,20 @@ class RemoteEncodeSubmit:
         def _work():
             try:
                 result = send_encode_request(packed, server_url)
-                torch.save(_serialize(result), payload_path)
-                _encode_box_update(job_id, status="ready")
-                print(f"[h3-client] encode mailbox ready {job_id}", flush=True)
+                torch.save(_serialize(result), pt)
+                _box_set("encode", status="ready")
+                print("[h3-client] encode mailbox ready", flush=True)
             except Exception as e:
-                _encode_box_update(job_id, status="error", error=str(e))
-                print(f"[h3-client] encode mailbox error {job_id}: {e}", flush=True)
+                _box_set("encode", status="error", error=str(e))
+                print(f"[h3-client] encode mailbox error: {e}", flush=True)
 
         threading.Thread(target=_work, daemon=True).start()
-        print(f"[h3-client] encode mailbox submit {job_id}", flush=True)
+        print("[h3-client] encode mailbox submit", flush=True)
         return (latent if latent is not None else trigger,)
 
 
-def _mailbox_wait(load_fn, kind, timeout=7200, wait_empty=False):
-    """ready 回傳；running 就等。wait_empty 時信箱空也繼續等，不立刻報錯。"""
-    import comfy.model_management as mm
-
-    t0 = time.time()
-    while True:
-        with _MAILBOX_LOCK:
-            data = load_fn()
-            jobs = data.get("jobs") or []
-            ready = next((j for j in jobs if j.get("status") == "ready"), None)
-            running = any(j.get("status") == "running" for j in jobs)
-            failed = next((j for j in jobs if j.get("status") == "error"), None)
-        if ready is not None:
-            return ready
-        if failed is not None and not running:
-            raise RuntimeError(f"{kind} mailbox error: {failed.get('error')}")
-        if not running and not wait_empty:
-            return None
-        if time.time() - t0 > timeout:
-            raise RuntimeError(f"{kind} mailbox wait timeout ({timeout}s)")
-        if mm.processing_interrupted():
-            mm.throw_exception_if_processing_interrupted()
-        why = "running" if running else "empty"
-        print(f"[h3-client] {kind} mailbox {why}, waiting {time.time()-t0:.0f}s",
-              flush=True)
-        time.sleep(0.4)
-
-
 class RemoteEncodeCollect:
-    """跨圖信箱：拿上一輪 encode。還在跑就等；信箱空立刻報錯。"""
+    """拿目前跑完的那一包 encode（上一輪 Submit）。還在跑就堵；空立刻報錯。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -784,20 +735,12 @@ class RemoteEncodeCollect:
         return float("NaN")
 
     def collect(self):
-        job = _mailbox_wait(_encode_box_load, "encode", wait_empty=False)
-        if job is None:
+        slot = _box_wait("encode", "ready")
+        if slot is None:
             raise RuntimeError("encode mailbox empty")
-        path = job.get("result_path")
-        if not path or not os.path.isfile(path):
-            _encode_box_update(job["id"], status="error", error="result missing")
-            raise RuntimeError(f"encode job {job['id']} result missing")
-        result = _deserialize(torch.load(path, weights_only=False))
-        _encode_box_update(job["id"], status="collected")
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        print(f"[h3-client] encode mailbox collect {job['id']}", flush=True)
+        packed = _box_take("encode")
+        result = _deserialize(packed)
+        print("[h3-client] encode mailbox collect", flush=True)
         return (result["positive"], result["latent"])
 
 

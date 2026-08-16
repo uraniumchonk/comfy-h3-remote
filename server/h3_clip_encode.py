@@ -11,7 +11,6 @@ MiniMax H3 遠端 encode server（官方 MiniMaxH3ReferenceToVideo 路徑）
 import argparse
 import asyncio
 import io
-import itertools
 import math
 import os
 import sys
@@ -19,7 +18,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 
@@ -258,31 +257,45 @@ def run_encode(data):
         _free_gpu("after-clip")
 
 
+class _HoldResponse(Response):
+    """Keep the slot until the client finishes taking the completed payload."""
+
+    def __init__(self, content, media_type, release):
+        super().__init__(content=content, media_type=media_type)
+        self._release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._release()
+
+
 app = FastAPI(title="MiniMax H3 Remote Encode")
 _POOL = ThreadPoolExecutor(max_workers=1)
-_QDEPTH = 0
-_QLOCK = threading.Lock()
-_QID = itertools.count(1)
+_SLOT = "idle"
+_SLOT_LOCK = threading.Lock()
 
 
-def _run_queued(fn, *args):
-    global _QDEPTH
-    with _QLOCK:
-        _QDEPTH += 1
-        jid = next(_QID)
-        waiting = _QDEPTH - 1
-    print(f"[h3-encode] queue count={jid} waiting={waiting}", flush=True)
-    try:
-        return fn(*args)
-    finally:
-        with _QLOCK:
-            _QDEPTH -= 1
+def _slot_try():
+    global _SLOT
+    with _SLOT_LOCK:
+        if _SLOT != "idle":
+            return False
+        _SLOT = "busy"
+        return True
+
+
+def _slot_free():
+    global _SLOT
+    with _SLOT_LOCK:
+        _SLOT = "idle"
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "clip": CLIP is not None, "video_vae": VIDEO_VAE is not None,
-            "queue": _QDEPTH}
+            "slot": _SLOT, "queue": 0 if _SLOT == "idle" else 1}
 
 
 @app.get("/progress")
@@ -293,16 +306,20 @@ def progress():
 @app.post("/encode")
 async def encode_endpoint(request: Request):
     import traceback
+    if not _slot_try():
+        print("[h3-encode] slot busy, reject", flush=True)
+        return Response(content=b"busy", status_code=409)
     try:
         body = await request.body()
         print(f"[h3-encode] /encode {len(body)/1e6:.1f}MB", flush=True)
         data = load_bytes(body)
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_POOL, _run_queued, run_encode, data)
+        result = await loop.run_in_executor(_POOL, run_encode, data)
         payload = dump_bytes(result)
-        print(f"[h3-encode] packed {len(payload)/1e6:.1f}MB wait client", flush=True)
-        return Response(content=payload, media_type="application/octet-stream")
+        print(f"[h3-encode] packed {len(payload)/1e6:.1f}MB hold", flush=True)
+        return _HoldResponse(payload, "application/octet-stream", _slot_free)
     except Exception:
+        _slot_free()
         tb = traceback.format_exc()
         print(tb, flush=True)
         return Response(content=tb.encode(), status_code=500, media_type="text/plain")

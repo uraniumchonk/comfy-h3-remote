@@ -108,7 +108,7 @@ python server/h3_vae_decode.py \
   --dp 1 --host 127.0.0.1 --port 8300
 ```
 
-請求會先等 `/health` 再送本體；同服務 FIFO 排隊。Kitchen RoPE 只認 `cuda:0`，雙卡 decode 要獨立 process + `CUDA_VISIBLE_DEVICES` remap。
+請求會先等 `/health` 再送本體；encode/decode 只 hold 一個 slot，第二槍 409 直到前端把跑完的那包拉走。Kitchen RoPE 只認 `cuda:0`，雙卡 decode 要獨立 process + `CUDA_VISIBLE_DEVICES` remap。
 
 llama-swap 範本：`examples/llama-swap.yaml`（`h3-async` 組：encode 卡 1 + decode-1 卡 0）。
 
