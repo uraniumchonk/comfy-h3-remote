@@ -526,6 +526,12 @@ class RemoteDecodeSubmit:
                     "multiline": False,
                 }),
             },
+            "optional": {
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                }),
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -538,10 +544,11 @@ class RemoteDecodeSubmit:
     def IS_CHANGED(cls, *values, **kwargs):
         return float("NaN")
 
-    def submit(self, samples, server_url):
+    def submit(self, samples, server_url, prompt=""):
         def _work():
             try:
-                _backend_kick(server_url, "/decode", {"samples": samples},
+                _backend_kick(server_url, "/decode",
+                               {"samples": samples, "prompt": prompt},
                                tag="decode")
             except Exception as e:
                 print(f"[h3-client] decode kick error: {e}", flush=True)
@@ -567,8 +574,8 @@ class RemoteDecodeCollect:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
+    RETURN_NAMES = ("images", "audio", "prompt")
     FUNCTION = "collect"
     CATEGORY = "Remote Pipe"
 
@@ -587,16 +594,18 @@ class RemoteDecodeCollect:
                 raw = _backend_take(server_url, tag="decode", empty="none",
                                     start=False)
             else:
-                return (torch.zeros(1, 8, 8, 3), False)
+                return (torch.zeros(1, 8, 8, 3), False, "")
         if isinstance(raw, Exception) or raw is None:
-            return (torch.zeros(1, 8, 8, 3), False)
+            return (torch.zeros(1, 8, 8, 3), False, "")
         packed = load_bytes(raw)
         if isinstance(packed, dict) and "frames" in packed:
             frames, audio = _unpack_decode(packed)
+            prompt = packed.get("prompt") or ""
         else:
             frames, audio = packed, False
+            prompt = ""
         audio = _audio_or_false(audio)
-        return (frames, audio)
+        return (frames, audio, prompt)
 
 
 class RemoteDecodeGet(RemoteDecodeCollect):
@@ -742,8 +751,8 @@ class RemoteEncodeCollect:
             },
         }
 
-    RETURN_TYPES = ("CONDITIONING", "LATENT")
-    RETURN_NAMES = ("positive", "latent")
+    RETURN_TYPES = ("CONDITIONING", "LATENT", "STRING")
+    RETURN_NAMES = ("positive", "latent", "prompt")
     FUNCTION = "collect"
     CATEGORY = "Remote Pipe"
 
@@ -764,7 +773,8 @@ class RemoteEncodeCollect:
         if raw is None:
             raise RuntimeError("encode mailbox empty")
         result = load_bytes(raw)
-        return (result["positive"], result["latent"])
+        return (result["positive"], result["latent"],
+                result.get("prompt") or "")
 
 
 class RemoteDenoiseSampler:
