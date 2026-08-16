@@ -355,7 +355,10 @@ class _Job:
 def _run_job(job):
     global _SLOT, _HELD
     try:
-        result = run_decode(job.data.get("samples") if isinstance(job.data, dict) else job.data, _WORLD)
+        samples = job.data.get("samples") if isinstance(job.data, dict) else job.data
+        result = run_decode(samples, _WORLD)
+        if isinstance(job.data, dict):
+            result["prompt"] = job.data.get("prompt") or ""
         payload = dump_bytes(result)
         with _SLOT_LOCK:
             _HELD = payload

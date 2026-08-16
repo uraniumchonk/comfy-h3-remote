@@ -249,7 +249,7 @@ def run_encode(data):
         elapsed = time.time() - t0
         PROGRESS.update(status="done", elapsed=elapsed)
         print(f"[h3-encode] 完成 {elapsed:.1f}s", flush=True)
-        return {"positive": cond, "latent": latent}
+        return {"positive": cond, "latent": latent, "prompt": prompt}
     except Exception:
         PROGRESS.update(status="error", elapsed=time.time() - t0)
         raise
