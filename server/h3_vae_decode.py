@@ -359,6 +359,7 @@ def _run_job(job):
         result = run_decode(samples, _WORLD)
         if isinstance(job.data, dict):
             result["prompt"] = job.data.get("prompt") or ""
+            result["seed"] = int(job.data.get("seed") or 0)
         payload = dump_bytes(result)
         with _SLOT_LOCK:
             _HELD = payload
