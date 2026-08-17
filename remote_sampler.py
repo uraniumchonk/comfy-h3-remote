@@ -531,6 +531,11 @@ class RemoteDecodeSubmit:
                     "multiline": True,
                     "default": "",
                 }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                }),
             },
         }
 
@@ -544,11 +549,12 @@ class RemoteDecodeSubmit:
     def IS_CHANGED(cls, *values, **kwargs):
         return float("NaN")
 
-    def submit(self, samples, server_url, prompt=""):
+    def submit(self, samples, server_url, prompt="", seed=0):
         def _work():
             try:
                 _backend_kick(server_url, "/decode",
-                               {"samples": samples, "prompt": prompt},
+                               {"samples": samples, "prompt": prompt,
+                                "seed": int(seed)},
                                tag="decode")
             except Exception as e:
                 print(f"[h3-client] decode kick error: {e}", flush=True)
@@ -574,8 +580,8 @@ class RemoteDecodeCollect:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
-    RETURN_NAMES = ("images", "audio", "prompt")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING", "INT")
+    RETURN_NAMES = ("images", "audio", "prompt", "seed")
     FUNCTION = "collect"
     CATEGORY = "Remote Pipe"
 
@@ -594,18 +600,20 @@ class RemoteDecodeCollect:
                 raw = _backend_take(server_url, tag="decode", empty="none",
                                     start=False)
             else:
-                return (torch.zeros(1, 8, 8, 3), False, "")
+                return (torch.zeros(1, 8, 8, 3), False, "", 0)
         if isinstance(raw, Exception) or raw is None:
-            return (torch.zeros(1, 8, 8, 3), False, "")
+            return (torch.zeros(1, 8, 8, 3), False, "", 0)
         packed = load_bytes(raw)
         if isinstance(packed, dict) and "frames" in packed:
             frames, audio = _unpack_decode(packed)
             prompt = packed.get("prompt") or ""
+            seed = int(packed.get("seed") or 0)
         else:
             frames, audio = packed, False
             prompt = ""
+            seed = 0
         audio = _audio_or_false(audio)
-        return (frames, audio, prompt)
+        return (frames, audio, prompt, seed)
 
 
 class RemoteDecodeGet(RemoteDecodeCollect):

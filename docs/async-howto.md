@@ -54,8 +54,8 @@ Prefill 若是墊檔，第一支廢片刪掉即可。
 |---|---|
 | Encode Submit | Fire-and-forget CLIP. `trigger` after denoise so it does not fight DiT. |
 | Encode Collect | Wait if mailbox still running. Error only if truly empty. |
-| Decode Submit | Send AV latent. `trigger` out is the same latent (passthrough). Blocks if the single slot is still occupied. |
-| Decode Collect | Do not wait if running. Only pop when backend slot is hold. `audio` is `False` otherwise. |
+| Decode Submit | Send AV latent plus optional `prompt` / `seed`. `trigger` out is the same latent (passthrough). Blocks if the single slot is still occupied. |
+| Decode Collect | Do not wait if running. Only pop when backend slot is hold. Extra outputs: `prompt`, `seed`. `audio` is `False` otherwise. |
 
 `cfg` must be **1.0**. H3 is flow-matching.
 
