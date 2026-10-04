@@ -8,8 +8,8 @@ video-ref) and times, per block:
   - compute (attn + mlp on both cards)
 
 Usage (GPU box, after unloading H3):
-  PYTHONPATH=/home/user/comfy_h3_server \
-    /home/user/comfy_h3_server/.venv/bin/python3 profile_comm.py [seq_len]
+  PYTHONPATH=~/comfy_h3_server \
+    ~/comfy_h3_server/.venv/bin/python3 profile_comm.py [seq_len]
 """
 import os
 import sys
